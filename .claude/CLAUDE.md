@@ -8,7 +8,7 @@ A reusable [smevals](https://github.com/prime-radiant-inc/smevals) Runner that d
 
 ## How work runs here
 
-This repo is one script plus its tests, built from the desk: plan mode, TDD, direct edits. No OpenSpec, no beads. Issues on this repo are disabled; it is planned from a private workbench whose eval suites are its first consumer.
+This repo is one script plus its tests, built from the desk: plan mode, TDD, direct edits. No OpenSpec, no beads. Issues here track defects and changes in the runner itself; the eval suites that consume it plan in their own backlogs and move their pin when a version ships.
 
 The package is public. Nothing in it, its history, or its commit messages may name private infrastructure, employers, or personal addresses; commits are authored under the GitHub noreply identity set in this clone's git config.
 
