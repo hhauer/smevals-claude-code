@@ -1,0 +1,12 @@
+# ABOUTME: Default import-linter contracts — forbids dependency cycles between
+# ABOUTME: sibling modules. A starting point; tune per project.
+
+# acyclic_siblings requires import-linter >=2.6.
+
+[importlinter]
+root_package = smevals_claude_code
+
+[importlinter:contract:acyclic-siblings]
+name = No cycles between sibling modules
+type = acyclic_siblings
+ancestors = smevals_claude_code

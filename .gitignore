@@ -64,3 +64,19 @@ tmbootpicker.efi
 # Claude
 .claude/settings.local.json
 .private-journal
+# Python — bytecode
+__pycache__/
+*.py[cod]
+# Virtual environment (uv)
+.venv/
+# Tool caches (ruff, pytest)
+.ruff_cache/
+.pytest_cache/
+# Coverage (pytest-cov)
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+# Build output (uv build), root-anchored so a nested dist/ is never swallowed
+/dist/
+*.egg-info/
