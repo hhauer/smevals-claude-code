@@ -1,5 +1,3 @@
 {
-  "enabledPlugins": {
-    "modern-python@trailofbits": true
-  }
+  "enabledPlugins": {}
 }
