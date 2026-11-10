@@ -22,13 +22,13 @@ prompt. Residual: the harness's built-in skill listing stays visible; only ``--b
 The subject session must not read the operator's files either: a suite's skills, fixtures, and
 checkers sit on the same disk, and a session that finds them is no longer measuring what the eval
 means to. The session runs under the macOS sandbox (``sandbox-exec``), unable to read or write
-under ``/Users``, the operator's home, the base dir that holds every run's work dir, or claude's
-shared temp dir. It is given an empty home and a temp dir of its own, so the lookups tools make
-there find nothing instead of being refused. The rest of the system stays readable, so installed
-tools work; a tool or file that lives under the home dir is opened by ``--allow-read``, read-only,
-and recorded in ``subject-condition.md``. Residual: the shared temp dirs (``/tmp`` and the
-per-user temp root) stay readable outside the runner's base dir, because shells and tools need
-them, and the login keychain stays reachable, because OAuth reads it.
+under ``/Users``, the operator's home, the run dir, the base dir that holds every run's work
+dir, or claude's shared temp dir. It is given an empty home and a temp dir of its own, so the
+lookups tools make there find nothing instead of being refused. The rest of the system stays
+readable, so installed tools work; a tool or file that lives under the home dir is opened by
+``--allow-read``, read-only, and recorded in ``subject-condition.md``. Residual: the shared temp
+dirs (``/tmp`` and the per-user temp root) stay readable outside the runner's base dir, because
+shells and tools need them, and the login keychain stays reachable, because OAuth reads it.
 
 The worked tree is copied back afterwards, on failure too, for post-mortems, into ``worked/`` in
 the run dir. The tree is the subject's, symlinks included, and nothing else writes inside
@@ -97,6 +97,10 @@ STREAM_FILE = "subject-stream.jsonl"
 # How often the stream reader checks whether claude has exited, and how much it reads at once.
 STREAM_POLL_SECS = 0.5
 STREAM_CHUNK_BYTES = 65536
+# How long the stream reader keeps reading once claude has exited. What claude printed last is
+# already in the pipe and is read at once; the limit is for a process that outlives claude and
+# never stops writing.
+STREAM_DRAIN_SECS = 1.0
 
 
 def fail(message: str) -> NoReturn:
@@ -403,15 +407,22 @@ def stamp_stream(stdout: BinaryIO, log: BinaryIO, exited: threading.Event) -> No
     """Stamp each line claude prints as it arrives, until claude has exited and nothing is ready.
 
     The pipe is polled, not read to its end: a background job the subject started inherits
-    the pipe and can hold it open long after claude exits, and the run must not wait on it. A
-    line split across reads is stamped when its newline arrives; a final line with none is
-    stamped at the end.
+    the pipe and can hold it open long after claude exits, and the run must not wait on it.
+    Once claude has exited, reading stops when the pipe is empty or after ``STREAM_DRAIN_SECS``,
+    whichever comes first, so a job that keeps writing cannot hold the run either. A line split
+    across reads is stamped when its newline arrives; a final line with none is stamped at the
+    end.
     """
     descriptor = stdout.fileno()
     pending = b""
+    drain_until = None
     with selectors.DefaultSelector() as selector:
         selector.register(descriptor, selectors.EVENT_READ)
         while True:
+            if exited.is_set() and drain_until is None:
+                drain_until = time.monotonic() + STREAM_DRAIN_SECS
+            if drain_until is not None and time.monotonic() >= drain_until:
+                break
             if not selector.select(0 if exited.is_set() else STREAM_POLL_SECS):
                 if exited.is_set():
                     break
@@ -591,11 +602,14 @@ def main(argv: list[str] | None = None) -> int:
         # (measured with the security CLI on Darwin 25.6.0).
         (session_home / "Library" / "Keychains").symlink_to(keychains)
         stage(args.stage, work_dir)
+        # The run dir is hidden wherever it is: it holds the runner's records of this
+        # session, and its neighbours are other runs.
         hidden = [
             Path("/Users"),
             operator_home,
             base,
             Path(f"/private/tmp/claude-{os.getuid()}"),
+            run_dir.resolve(),
         ]
         own = [work_dir, session_home, session_tmp, keychains]
         # The claude executable, by the path it is run by and the file that resolves to.

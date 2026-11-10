@@ -35,8 +35,9 @@ STREAM_LINES = [
 # to read (as a directory listing or a file), STUB_STEAL a path to hard-link or move into the work
 # dir, and STUB_PLANT a path to create. The stub also records the home and temp dirs it was
 # handed, where the home's keychain link points, and whether a temp file round-trips. Asked for
-# stream-json it prints STUB_STREAM verbatim instead of a result record, and STUB_LINGER leaves a
-# background process holding its stdout open after it exits.
+# stream-json it prints STUB_STREAM verbatim instead of a result record. STUB_LINGER leaves a
+# background process holding its stdout open after it exits, and STUB_FLOOD one that keeps
+# writing to it.
 STUB = """#!/usr/bin/env bash
 set -euo pipefail
 trap 'exit 143' TERM
@@ -95,6 +96,11 @@ if [[ -n ${STUB_HOSTILE:-} ]]; then
 fi
 if [[ -n ${STUB_LINGER:-} ]]; then
   sleep "$STUB_LINGER" </dev/null 2>/dev/null &
+fi
+if [[ -n ${STUB_FLOOD:-} ]]; then
+  yes flood </dev/null 2>/dev/null &
+  flood_pid=$!
+  (sleep "$STUB_FLOOD" && kill "$flood_pid") </dev/null >/dev/null 2>&1 &
 fi
 if [[ " $* " == *" stream-json "* ]]; then
   printf '%s' "${STUB_STREAM:-}"
@@ -236,6 +242,7 @@ def host_paths_the_subject_must_not_read() -> list:
         pytest.param(lambda s: s.home, id="the operator's home"),
         pytest.param(lambda s: s.sibling_fixture, id="sibling run's fixture"),
         pytest.param(lambda s: s.sibling_fixture.parent.parent.parent, id="the runner's base dir"),
+        pytest.param(lambda s: s.run_dir, id="the run dir"),
         pytest.param(
             lambda _: REPO_ROOT / "pyproject.toml", id="file under /Users", marks=in_users
         ),
@@ -300,6 +307,17 @@ def test_subject_cannot_write_into_the_operators_home(scratch: Scratch) -> None:
     planted = scratch.home / "planted.md"
     scratch.env["STUB_PLANT"] = str(planted)
     proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.recorded("plant") == "refused"
+    assert not planted.exists()
+
+
+def test_subject_cannot_write_into_the_run_dir(scratch: Scratch) -> None:
+    # The run dir holds the runner's records of the session; in stream mode one of them is
+    # being written while the session runs.
+    planted = scratch.run_dir / "planted.md"
+    scratch.env["STUB_PLANT"] = str(planted)
+    proc = scratch.run(["--stage", str(scratch.corpus), "--stream"])
     assert proc.returncode == 0, proc.stderr
     assert scratch.recorded("plant") == "refused"
     assert not planted.exists()
@@ -819,3 +837,17 @@ def test_stream_mode_does_not_wait_on_a_process_the_session_left_behind(scratch:
     assert time.monotonic() - start < 10
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout == "STUB-RESULT\ntwo lines\n"
+
+
+def test_stream_mode_stops_reading_a_process_that_keeps_writing_after_exit(
+    scratch: Scratch,
+) -> None:
+    # Left unbounded, a background job that never stops writing would hold the run past its
+    # watchdog and grow the stream file without limit.
+    scratch.env["STUB_FLOOD"] = "25"
+    start = time.monotonic()
+    proc = scratch.run(["--stage", str(scratch.corpus), "--stream"])
+    assert time.monotonic() - start < 12
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "STUB-RESULT\ntwo lines\n"
+    assert json.loads(scratch.stream()[-1][1]) == {"type": "runner_exit", "returncode": 0}
