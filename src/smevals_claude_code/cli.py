@@ -91,8 +91,9 @@ resolves to. ``--home-copy <path>`` copies a file or directory under the operato
 the session's home at the same path relative to home. Symlinks are followed, because such trees
 are often farms of links into another tree under the home, which a link or a read grant would
 reach without reaching what they point at; the session gets regular files with the targets'
-content and modes. The copy is readable and not writable: in production a write there would
-edit the operator's files. It is not copied back. ``subject-condition.md`` records each entry's
+content and modes. The copy is readable and not writable, and the directories above it cannot
+be moved aside: in production a write there would edit the operator's files. It is not
+copied back. ``subject-condition.md`` records each entry's
 home-relative path and a SHA-256 over the copied files, because they are part of what the
 subject runs. The claude command line is unchanged, so claude's Read tool still refuses the
 copy as it does any path outside the work dir; the commands a session runs reach it.
@@ -487,7 +488,11 @@ def sandbox_rule(action: str, operations: str, path: Path) -> str:
 
 
 def sandbox_profile(
-    hidden: list[Path], own: list[Path], readable: list[Path], read_only: list[Path]
+    hidden: list[Path],
+    own: list[Path],
+    readable: list[Path],
+    read_only: list[Path],
+    pinned: list[Path],
 ) -> str:
     """Write the macOS sandbox profile the session runs under.
 
@@ -498,7 +503,9 @@ def sandbox_profile(
     opened again afterwards: ``own`` for reading and writing, ``readable`` for reading only.
     Reaching a path takes metadata on each of its parents, so those are opened for metadata
     only, which lets a parent be traversed but not listed. ``read_only`` paths sit inside an
-    ``own`` tree and are closed to writing again.
+    ``own`` tree and are closed to writing again. ``pinned`` directories are the ones above
+    them in that tree: each stays open to new entries but cannot itself be moved or removed,
+    which would let another tree be put where the read-only one was.
     """
     lines = ["(version 1)", "(allow default)"]
     lines += [f"(deny file-read* file-write* (subpath {sandbox_string(path)}))" for path in hidden]
@@ -507,6 +514,7 @@ def sandbox_profile(
     lines += [sandbox_rule("allow", "file-read* file-write*", path) for path in own]
     lines += [sandbox_rule("allow", "file-read*", path) for path in readable]
     lines += [sandbox_rule("deny", "file-write*", path) for path in read_only]
+    lines += [f"(deny file-write* (literal {sandbox_string(path)}))" for path in pinned]
     return "\n".join(lines) + "\n"
 
 
@@ -923,6 +931,7 @@ def main(argv: list[str] | None = None) -> int:
         # tree under the home, and a link would lead the session back to what is hidden. The
         # session's home is its own to write, so the copies are closed to writing again.
         read_only = []
+        pinned: set[Path] = set()
         for source, rel, _ in home_copies:
             copy = session_home / rel
             copy.parent.mkdir(parents=True, exist_ok=True)
@@ -931,6 +940,8 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 shutil.copy2(source, copy)
             read_only.append(copy)
+            # The home and each directory between it and the copy.
+            pinned.update(session_home / parent for parent in rel.parents)
         stage(args.stage, work_dir)
         # The run dir is hidden wherever it is: it holds the runner's records of this
         # session, and its neighbours are other runs.
@@ -962,7 +973,11 @@ def main(argv: list[str] | None = None) -> int:
             readable.append(session_plugin)
             prompt = prompt.replace(PLUGIN_ROOT_VARIABLE, str(session_plugin))
         result_file = session_root / "result.json"
-        cmd = [sandbox_exec, "-p", sandbox_profile(hidden, own, readable, read_only)]
+        cmd = [
+            sandbox_exec,
+            "-p",
+            sandbox_profile(hidden, own, readable, read_only, sorted(pinned)),
+        ]
         cmd += build_command(
             claude,
             model,

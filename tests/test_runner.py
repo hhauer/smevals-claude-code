@@ -48,7 +48,8 @@ STREAM_LINES = [
 # whether it could write there. STUB_GIT_COMMIT makes a repository in the work dir and commits
 # to it, recording the author git used or that the commit failed. STUB_HOME_FILE names a path
 # under the session's home: the stub records what kind of file is there, its body, whether it
-# could write to it, and every regular file and every link the home holds.
+# could write to it, whether it could move aside the top directory of that path or the home
+# itself, and every regular file and every link the home holds.
 STUB = """#!/usr/bin/env bash
 set -euo pipefail
 trap 'exit 143' TERM
@@ -121,6 +122,20 @@ if [[ -n ${STUB_HOME_FILE:-} ]]; then
     echo planted > "$STUB_LOG.homeplant"
   else
     echo refused > "$STUB_LOG.homeplant"
+  fi
+  # Moving a directory the file sits under aside would let another be put in its place.
+  home_top="$HOME/${STUB_HOME_FILE%%/*}"
+  if mv "$home_top" "$HOME/moved-aside" 2>/dev/null; then
+    echo moved > "$STUB_LOG.hometop"
+    mv "$HOME/moved-aside" "$home_top"
+  else
+    echo refused > "$STUB_LOG.hometop"
+  fi
+  if mv "$HOME" "$PWD/moved-home" 2>/dev/null; then
+    echo moved > "$STUB_LOG.homemove"
+    mv "$PWD/moved-home" "$HOME"
+  else
+    echo refused > "$STUB_LOG.homemove"
   fi
   (cd "$HOME" && find . -type f | sort) > "$STUB_LOG.homefiles"
   (cd "$HOME" && find . -type l | sort) > "$STUB_LOG.homelinks"
@@ -1329,6 +1344,9 @@ def test_two_home_copies_under_one_parent_both_land(scratch: Scratch) -> None:
     assert proc.returncode == 0, proc.stderr
     assert scratch.recorded("homefile") == "NOTES"
     assert scratch.recorded("homeplant") == "refused"
+    # A copy that cannot be written could still be replaced by moving a directory above it.
+    assert scratch.recorded("hometop") == "refused"
+    assert scratch.recorded("homemove") == "refused"
     assert scratch.recorded("homefiles").splitlines() == [
         "./.gitconfig",
         "./Developer/.claude/notes.md",
