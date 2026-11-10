@@ -461,7 +461,10 @@ def main(argv: list[str] | None = None) -> int:
         for directory in (work_dir, session_home / "Library", session_tmp):
             directory.mkdir(parents=True)
         # OAuth reads the login keychain, which is found through the home dir. A refreshed
-        # token is written back to it, so the session can write there too.
+        # token is written back to it, so the session can write there too. The write needs the
+        # whole directory: a keychain item is saved through a temp file beside the keychain, and
+        # with the directory read-only or only the keychain file writable the save is refused
+        # (measured with the security CLI on Darwin 25.6.0).
         (session_home / "Library" / "Keychains").symlink_to(keychains)
         stage(args.stage, work_dir)
         hidden = [
