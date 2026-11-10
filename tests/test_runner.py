@@ -22,9 +22,9 @@ RUNNER_LINE = f"runner: smevals-claude-code {version('smevals-claude-code')}\n"
 # a result record). STUB_SLEEP simulates a hung session for the watchdog test; the TERM trap and
 # backgrounded sleep model the real claude CLI dying promptly on SIGTERM. Three hooks act the way
 # a curious or hostile subject would and record how the sandbox answered: STUB_PROBE names a path
-# to read (as a directory listing or a file), STUB_STEAL a path to move into the work dir, and
-# STUB_PLANT a path to create. The stub also records the home and temp dirs it was handed, where
-# the home's keychain link points, and whether a temp file round-trips.
+# to read (as a directory listing or a file), STUB_STEAL a path to hard-link or move into the work
+# dir, and STUB_PLANT a path to create. The stub also records the home and temp dirs it was
+# handed, where the home's keychain link points, and whether a temp file round-trips.
 STUB = """#!/usr/bin/env bash
 set -euo pipefail
 trap 'exit 143' TERM
@@ -50,7 +50,9 @@ if [[ -n ${STUB_PROBE:-} ]]; then
   fi
 fi
 if [[ -n ${STUB_STEAL:-} ]]; then
-  if mv "$STUB_STEAL" ./stolen 2>/dev/null; then
+  if ln "$STUB_STEAL" ./linked 2>/dev/null; then
+    echo linked > "$STUB_LOG.steal"
+  elif mv "$STUB_STEAL" ./stolen 2>/dev/null; then
     echo moved > "$STUB_LOG.steal"
   else
     echo refused > "$STUB_LOG.steal"
@@ -257,8 +259,8 @@ def test_temp_outside_the_runner_base_stays_readable(scratch: Scratch) -> None:
     ],
 )
 def test_subject_cannot_move_a_hidden_file_into_its_work_dir(scratch: Scratch, hidden_file) -> None:
-    # Moving a file reads nothing, so hiding a path from reads alone would let it be carried
-    # into the work dir and read there.
+    # Moving or hard-linking a file reads nothing, so hiding a path from reads alone would let
+    # it be carried into the work dir and read there.
     target = hidden_file(scratch)
     body = target.read_text()
     scratch.env["STUB_STEAL"] = str(target)
@@ -267,6 +269,7 @@ def test_subject_cannot_move_a_hidden_file_into_its_work_dir(scratch: Scratch, h
     assert scratch.recorded("steal") == "refused"
     assert target.read_text() == body
     assert not (scratch.run_dir / "worked" / "stolen").exists()
+    assert not (scratch.run_dir / "worked" / "linked").exists()
 
 
 def test_subject_cannot_write_into_the_operators_home(scratch: Scratch) -> None:
@@ -343,6 +346,23 @@ def test_session_gets_a_home_and_temp_dir_of_its_own(scratch: Scratch) -> None:
     assert scratch.recorded("keychains") == str(scratch.home.resolve() / "Library" / "Keychains")
     assert not Path(home).exists(), "session home cleaned up after the run"
     assert not Path(tmpdir).exists(), "session temp dir cleaned up after the run"
+
+
+def test_refuses_a_base_dir_someone_else_put_there(scratch: Scratch) -> None:
+    # The base dir has a fixed name under the temp root. One that is a link leads the run's
+    # dirs somewhere the sandbox profile does not describe.
+    temp_root = scratch.root / "other-tmp"
+    temp_root.mkdir()
+    elsewhere = scratch.root / "elsewhere"
+    elsewhere.mkdir()
+    (temp_root / "smevals-claude-code").symlink_to(elsewhere)
+    scratch.env["TMPDIR"] = str(temp_root)
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 1
+    assert "refusing to use" in proc.stderr
+    assert "smevals-claude-code" in proc.stderr
+    assert not scratch.claude_invoked()
+    assert list(elsewhere.iterdir()) == []
 
 
 def test_missing_sandbox_exec_fails_before_claude(scratch: Scratch) -> None:

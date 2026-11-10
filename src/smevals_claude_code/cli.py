@@ -447,6 +447,12 @@ def main(argv: list[str] | None = None) -> int:
     keychains = operator_home / "Library" / "Keychains"
     base = Path(tempfile.gettempdir()).resolve() / PROG
     base.mkdir(mode=0o700, exist_ok=True)
+    # The name is fixed, so on a shared temp root someone else could have put it there first.
+    if base.is_symlink() or base.stat().st_uid != os.getuid():
+        fail(
+            f"refusing to use {base} for run dirs: it is a link or belongs to another user; "
+            "remove it and run again"
+        )
     session_root = Path(tempfile.mkdtemp(dir=base))
     try:
         work_dir = session_root / "work"
