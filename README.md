@@ -7,7 +7,7 @@ The session runs under the macOS sandbox, so the runner needs macOS. The subject
 ## Install
 
 ```bash
-uv tool install "smevals-claude-code @ git+https://github.com/hhauer/smevals-claude-code@v0.2.0"
+uv tool install "smevals-claude-code @ git+https://github.com/hhauer/smevals-claude-code@v0.3.0"
 ```
 
 Pin a tag. A new version can change the `claude` command line or what the session can reach, which is the condition every eval anchor was measured under.
@@ -31,6 +31,8 @@ smevals-claude-code --stage "$CORPUS" --allow-read "$HOME/.local/share/mise/inst
 ```
 
 Graders read the subject's files from `worked/` in the run dir, for example `$SMEVALS_RUN_DIR/worked/report.md`.
+
+A suite that grades what happened during the session, such as how long the subject went quiet, passes `--stream`. The runner then records every event `claude` prints in `subject-stream.jsonl` in the run dir, one `<epoch seconds> <event JSON>` line each, stamped when it arrived. The first and last lines are the runner's own, `runner_launch` and `runner_exit`.
 
 `smevals-claude-code --help` documents every flag.
 
