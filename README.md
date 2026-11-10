@@ -2,12 +2,12 @@
 
 A reusable [smevals](https://github.com/prime-radiant-inc/smevals) Runner that drives an isolated headless Claude Code session. It stages fixtures into a temp work dir outside any repo, runs `claude -p --safe-mode` there under the model and effort the smevals config names, strips smevals task metadata from the subject's environment, kills a hung session, and copies the worked tree back into `worked/` in the run dir with a record of the condition the session ran under.
 
-The session runs under the macOS sandbox, so the runner needs macOS. The subject cannot read or write your home directory, other users' homes, or another run's work dir, which keeps a suite's skills, fixtures, and checkers out of its reach. It gets an empty home and a temp dir of its own. The rest of the system stays readable so installed tools keep working, and so do the shared temp dirs (`/tmp` and the per-user temp root) outside the runner's own.
+The session runs under the macOS sandbox, so the runner needs macOS. The subject cannot read or write your home directory, other users' homes, or another run's work dir, which keeps a suite's skills, fixtures, and checkers out of its reach. It gets a home and a temp dir of its own; the home holds only a git config with a fixed identity (`Eval Subject <subject@example.invalid>`), so a subject that commits does so under the same name on every machine. The rest of the system stays readable so installed tools keep working, and so do the shared temp dirs (`/tmp` and the per-user temp root) outside the runner's own.
 
 ## Install
 
 ```bash
-uv tool install "smevals-claude-code @ git+https://github.com/hhauer/smevals-claude-code@v0.3.0"
+uv tool install "smevals-claude-code @ git+https://github.com/hhauer/smevals-claude-code@v0.4.0"
 ```
 
 Pin a tag. A new version can change the `claude` command line or what the session can reach, which is the condition every eval anchor was measured under.
@@ -38,6 +38,10 @@ A tool or file the subject needs from your home directory, such as a language ru
 ```bash
 smevals-claude-code --stage "$CORPUS" --allow-read "$HOME/.local/share/mise/installs/python"
 ```
+
+Install paths differ per machine and per version, so ask the tool that owns the install for the path. With mise that is `--allow-read "$(mise where python)"`.
+
+The session runs with `--permission-mode acceptEdits`, under which Claude Code refuses a write to `.claude/` in the work dir when nobody is there to approve it, and an `--allowedTools` rule for the path does not change that (measured on Claude Code 2.1.321). A suite that needs such a file should have the subject write it elsewhere in the work dir.
 
 A subject whose skill text refers to its plugin's bundled files through `${CLAUDE_PLUGIN_ROOT}` names the plugin tree with `--plugin-root`. The session gets a read-only copy, and every `${CLAUDE_PLUGIN_ROOT}` in the prompt becomes the copy's path:
 
