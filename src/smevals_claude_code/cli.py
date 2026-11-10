@@ -94,9 +94,11 @@ reach without reaching what they point at; the session gets regular files with t
 content and modes. The copy is readable and not writable, and the directories above it cannot
 be moved aside: in production a write there would edit the operator's files. It is not
 copied back. ``subject-condition.md`` records each entry's
-home-relative path and a SHA-256 over the copied files, because they are part of what the
-subject runs. The claude command line is unchanged, so claude's Read tool still refuses the
-copy as it does any path outside the work dir; the commands a session runs reach it.
+home-relative path and a SHA-256 over the copied files and their permission bits, because they
+are part of what the subject runs. A copied directory is named to claude with ``--add-dir``,
+as a plugin tree is, so its Read tool will open it. A copied file is not, because the flag
+takes a directory and the file's would open whatever else sits there; the commands a session
+runs reach it all the same.
 
 ``--safe-mode`` does not drop a machine's managed settings. A session still runs their hooks,
 is allowed what their permission rules allow whatever the suite's own ``--allowedTools`` says,
@@ -120,6 +122,7 @@ import json
 import os
 import selectors
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -448,8 +451,9 @@ def resolve_home_copy(path: str, operator_home: Path) -> tuple[Path, Path, str]:
 
     The home-relative path is read from the path as written, not from where it resolves to:
     the session must find the copy where the subject's scripts look for the original. The
-    digest covers each file in sorted path order: its home-relative path, a NUL, its size in
-    decimal, a NUL, and its bytes.
+    digest covers each file in sorted path order: its home-relative path, a NUL, its
+    permission bits in octal, a NUL, its size in decimal, a NUL, and its bytes. The bits are
+    there because a hook that is no longer executable is one git skips.
     """
     if not os.path.lexists(path):
         fail(f"--home-copy path not found: {path}")
@@ -468,10 +472,11 @@ def resolve_home_copy(path: str, operator_home: Path) -> tuple[Path, Path, str]:
     digest = hashlib.sha256()
     for name, file in sorted(home_copy_files(source, rel, frozenset())):
         try:
+            mode = stat.S_IMODE(file.stat().st_mode)
             data = file.read_bytes()
         except OSError as error:
             fail(f"--home-copy could not read {file}: {error}")
-        digest.update(name.encode("utf-8") + b"\0" + str(len(data)).encode() + b"\0")
+        digest.update(f"{name}\0{mode:o}\0{len(data)}\0".encode())
         digest.update(data)
     return source, rel, digest.hexdigest()
 
@@ -524,7 +529,7 @@ def build_command(
     effort: str,
     mcp_config: str | None,
     context_file: Path | None,
-    plugin_dir: Path | None,
+    add_dirs: list[Path],
     claude_args: list[str],
     prompt: str,
     *,
@@ -533,9 +538,10 @@ def build_command(
     """Assemble the claude argv: the measured condition every anchor was taken under.
 
     A stream-mode session differs in its output format alone. A session given a plugin tree
-    has it named with ``--add-dir``: claude's Read tool is refused outside the work dir
-    otherwise, whatever the sandbox allows (measured on Claude Code 2.1.321). The sandbox is
-    what keeps the tree read-only.
+    or a copied home directory has it named with ``--add-dir``: claude's Read tool is refused
+    outside the work dir otherwise, whatever the sandbox allows (measured on Claude Code
+    2.1.321 for a plugin tree, 2.1.322 for a directory in the session's home). The sandbox is
+    what keeps those trees read-only.
     """
     output_format = ["stream-json", "--verbose"] if stream else ["json"]
     if mcp_config is not None:
@@ -570,8 +576,8 @@ def build_command(
         cmd += ["--effort", effort]
     if context_file is not None:
         cmd += ["--append-system-prompt-file", str(context_file)]
-    if plugin_dir is not None:
-        cmd += ["--add-dir", str(plugin_dir)]
+    for directory in add_dirs:
+        cmd += ["--add-dir", str(directory)]
     cmd += claude_args
     cmd += ["--", prompt]
     return cmd
@@ -931,6 +937,7 @@ def main(argv: list[str] | None = None) -> int:
         # tree under the home, and a link would lead the session back to what is hidden. The
         # session's home is its own to write, so the copies are closed to writing again.
         read_only = []
+        add_dirs = []
         pinned: set[Path] = set()
         for source, rel, _ in home_copies:
             copy = session_home / rel
@@ -940,6 +947,10 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 shutil.copy2(source, copy)
             read_only.append(copy)
+            # A file is not named: --add-dir takes a directory, and the file's would open
+            # whatever else sits there.
+            if source.is_dir():
+                add_dirs.append(copy)
             # The home and each directory between it and the copy.
             pinned.update(session_home / parent for parent in rel.parents)
         stage(args.stage, work_dir)
@@ -971,6 +982,7 @@ def main(argv: list[str] | None = None) -> int:
             session_plugin = session_root / "plugin"
             shutil.copytree(args.plugin_root, session_plugin, symlinks=True)
             readable.append(session_plugin)
+            add_dirs.insert(0, session_plugin)
             prompt = prompt.replace(PLUGIN_ROOT_VARIABLE, str(session_plugin))
         result_file = session_root / "result.json"
         cmd = [
@@ -984,7 +996,7 @@ def main(argv: list[str] | None = None) -> int:
             effort,
             mcp_config,
             context_file,
-            session_plugin,
+            add_dirs,
             args.claude_args,
             prompt,
             stream=args.stream,

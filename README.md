@@ -121,8 +121,8 @@ smevals-claude-code --stage "$CORPUS" --home-copy "$HOME/.hooks"
 - **Symlinks are followed.** The session gets regular files with the content and modes of what the links point at, so a tree of links into a dotfiles checkout works.
 - **The copy is read-only to the session.** In production a write there would edit your files, so the subject is refused.
 - **Nothing is copied back.** `worked/` holds the work dir only.
-- **Each entry is recorded** in `subject-condition.md` with a SHA-256 of the copied files, so an edit to one of them shows up as a changed condition.
-- **Claude Code's Read tool does not open the copy.** It refuses any path outside the work dir. Commands the subject runs, such as `cat` or a git hook, reach it.
+- **Each entry is recorded** in `subject-condition.md` with a SHA-256 of the copied files and their permission bits, so an edit to one of them shows up as a changed condition.
+- **A copied directory is named to `claude` with `--add-dir`,** so its Read tool will open it. A copied file is not: Read refuses it, and commands the subject runs, such as `cat`, reach it. Copy the file's directory when the subject must Read it.
 
 The run is refused before `claude` starts when the path is missing, is not under your home, holds a dangling symlink or a symlink loop, or would land on what the runner puts in the session's home (`.gitconfig` and `Library/`).
 
@@ -172,7 +172,7 @@ The exit code is the session's own. A session the watchdog killed exits non-zero
 
 `subject-condition.md` holds one `key: value` line for each of: the runner version, the Claude Code version, the model, the effort, a SHA-256 of the assembled context, the arguments forwarded to `claude`, each `--allow-read` grant, hidden managed settings, the plugin root, each `--home-copy` entry, the idle limit, and, as `resolved:`, the model IDs the session reports having used. A line appears only when it applies.
 
-A `home-copy:` line holds the home-relative path and a digest of the files copied, for example `home-copy: .hooks sha256:<digest>`. The digest covers every file in sorted path order: its home-relative path, a NUL byte, its size in decimal, a NUL byte, and its bytes. File modes are not part of it.
+A `home-copy:` line holds the home-relative path and a digest of the files copied, for example `home-copy: .hooks sha256:<digest>`. The digest covers every file in sorted path order: its home-relative path, a NUL byte, its permission bits in octal, a NUL byte, its size in decimal, a NUL byte, and its bytes.
 
 Every line except `resolved:` is settled before the session starts, so two runs of one condition differ in that line at most. Keep the record from the run an anchor was measured in, and a later run can be checked against it:
 

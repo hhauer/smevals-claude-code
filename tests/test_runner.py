@@ -1287,16 +1287,17 @@ def make_hooks(scratch: Scratch) -> tuple[Path, Path]:
     return hooks, target
 
 
-def home_copy_digest(files: dict[str, bytes]) -> str:
+def home_copy_digest(files: dict[str, tuple[str, bytes]]) -> str:
     """The digest the condition record carries for copied files, keyed by home-relative path.
 
-    Each file, in sorted path order, adds its path, a NUL, its size in decimal, a NUL, and
-    its bytes.
+    Each file, given as its permission bits in octal and its bytes, adds in sorted path order
+    its path, a NUL, the permission bits, a NUL, its size in decimal, a NUL, and its bytes.
     """
     digest = hashlib.sha256()
     for path in sorted(files):
-        digest.update(path.encode() + b"\0" + str(len(files[path])).encode() + b"\0")
-        digest.update(files[path])
+        mode, data = files[path]
+        digest.update(f"{path}\0{mode}\0{len(data)}\0".encode())
+        digest.update(data)
     return digest.hexdigest()
 
 
@@ -1319,13 +1320,22 @@ def test_home_copy_puts_the_files_behind_the_operators_links_in_the_session_home
         "./.hooks/python/pre-commit",
     ]
     assert scratch.recorded("homelinks").splitlines() == ["./Library/Keychains"]
-    assert scratch.argv() == [*BASE_ARGV, "PROMPT-TEXT"], "the flag adds nothing to claude's argv"
+    # Measured on Claude Code 2.1.322: a session's Read tool is refused in its own home unless
+    # the directory is named to claude, so a copied directory is.
+    session_home = scratch.recorded("dirs").splitlines()[0]
+    assert scratch.argv() == [
+        *BASE_ARGV[:8],
+        "--add-dir",
+        f"{session_home}/.hooks",
+        "--",
+        "PROMPT-TEXT",
+    ]
     assert not (scratch.run_dir / "worked" / ".hooks").exists(), "the copy is not copied back"
     assert scratch.condition() == (
         CONDITION_HEAD
         + "model: stub-model\n"
         + "home-copy: .hooks sha256:"
-        + home_copy_digest({".hooks/python/pre-commit": target.read_bytes()})
+        + home_copy_digest({".hooks/python/pre-commit": ("755", target.read_bytes())})
         + "\n"
         + "resolved: stub-model-id\n"
     )
@@ -1337,6 +1347,8 @@ def test_two_home_copies_under_one_parent_both_land(scratch: Scratch) -> None:
     (claude_dir / "rules" / "git.md").write_text("RULE-git\n")
     (claude_dir / "notes.md").write_text("NOTES\n")
     (claude_dir / "left-out.md").write_text("not named by any flag\n")
+    (claude_dir / "rules" / "git.md").chmod(0o644)
+    (claude_dir / "notes.md").chmod(0o600)
     scratch.env["STUB_HOME_FILE"] = "Developer/.claude/notes.md"
     proc = scratch.run(
         ["--home-copy", str(claude_dir / "rules"), "--home-copy", str(claude_dir / "notes.md")]
@@ -1352,33 +1364,50 @@ def test_two_home_copies_under_one_parent_both_land(scratch: Scratch) -> None:
         "./Developer/.claude/notes.md",
         "./Developer/.claude/rules/git.md",
     ]
+    # A copied directory is named to claude. A copied file is not: naming its directory would
+    # open whatever else sits there.
+    session_home = scratch.recorded("dirs").splitlines()[0]
+    assert scratch.argv() == [
+        *BASE_ARGV[:8],
+        "--add-dir",
+        f"{session_home}/Developer/.claude/rules",
+        "--",
+        "PROMPT-TEXT",
+    ]
     assert scratch.condition() == (
         CONDITION_HEAD
         + "model: stub-model\n"
         + "home-copy: Developer/.claude/rules sha256:"
-        + home_copy_digest({"Developer/.claude/rules/git.md": b"RULE-git\n"})
+        + home_copy_digest({"Developer/.claude/rules/git.md": ("644", b"RULE-git\n")})
         + "\n"
         + "home-copy: Developer/.claude/notes.md sha256:"
-        + home_copy_digest({"Developer/.claude/notes.md": b"NOTES\n"})
+        + home_copy_digest({"Developer/.claude/notes.md": ("600", b"NOTES\n")})
         + "\n"
         + "resolved: stub-model-id\n"
     )
 
 
-def test_home_copy_record_changes_when_a_copied_byte_does(scratch: Scratch) -> None:
-    # These files are part of what the subject runs. The edit is made behind the link, where
-    # nothing the suite names changes.
+def test_home_copy_record_changes_when_a_copied_byte_or_mode_does(scratch: Scratch) -> None:
+    # These files are part of what the subject runs, and a hook that is no longer executable
+    # is one git skips. The edits are made behind the link, where nothing the suite names
+    # changes.
     hooks, target = make_hooks(scratch)
     lines = []
-    for body in ("echo one\n", "echo one\n", "echo two\n"):
+    for body, mode in (
+        ("echo one\n", 0o755),
+        ("echo one\n", 0o755),
+        ("echo two\n", 0o755),
+        ("echo two\n", 0o644),
+    ):
         target.write_text(body)
+        target.chmod(mode)
         scratch.run_dir = scratch.root / f"run-{len(lines)}"
         scratch.run_dir.mkdir()
         proc = scratch.run(["--home-copy", str(hooks)])
         assert proc.returncode == 0, proc.stderr
         lines.append(scratch.condition())
     assert "home-copy: .hooks sha256:" in lines[0]
-    assert lines[0] == lines[1] != lines[2]
+    assert lines[0] == lines[1] != lines[2] != lines[3]
 
 
 def dangling_link(scratch: Scratch) -> Path:
