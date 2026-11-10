@@ -43,7 +43,9 @@ STREAM_LINES = [
 # background process holding its stdout open after it exits, and STUB_FLOOD one that keeps
 # writing to it. STUB_STREAM_WAIT keeps the session alive that long after its stream, as a
 # session waiting on a background job is, and it then prints STUB_STREAM_LATE. Asked for its
-# version it answers and does nothing else, or fails with STUB_VERSION_EXIT.
+# version it answers and does nothing else, or fails with STUB_VERSION_EXIT. STUB_PROMPT_PATH
+# treats the prompt as a path: the stub records the file's body, or that it was denied, and
+# whether it could write there.
 STUB = """#!/usr/bin/env bash
 set -euo pipefail
 trap 'exit 143' TERM
@@ -86,6 +88,15 @@ if [[ -n ${STUB_PLANT:-} ]]; then
     echo planted > "$STUB_LOG.plant"
   else
     echo refused > "$STUB_LOG.plant"
+  fi
+fi
+if [[ -n ${STUB_PROMPT_PATH:-} ]]; then
+  prompt_path="${*: -1}"
+  cat "$prompt_path" > "$STUB_LOG.promptfile" 2>/dev/null || echo denied > "$STUB_LOG.promptfile"
+  if { echo planted >> "$prompt_path"; } 2>/dev/null; then
+    echo planted > "$STUB_LOG.promptplant"
+  else
+    echo refused > "$STUB_LOG.promptplant"
   fi
 fi
 printf '%s\\n' "${HOME:-}" "${TMPDIR:-}" "${CLAUDE_CODE_TMPDIR:-}" > "$STUB_LOG.dirs"
@@ -1083,4 +1094,63 @@ def test_idle_limit_without_stream_fails_before_claude(scratch: Scratch) -> None
     proc = scratch.run(["--stage", str(scratch.corpus), "--idle-timeout", "5"])
     assert proc.returncode == 1
     assert "--idle-timeout needs --stream" in proc.stderr
+    assert not scratch.claude_invoked()
+
+
+def make_plugin(scratch: Scratch) -> Path:
+    """A plugin tree in the operator's home, where the sandboxed session cannot read it."""
+    plugin = scratch.home / "plugins" / "demo"
+    (plugin / "scripts").mkdir(parents=True)
+    (plugin / "scripts" / "tool.sh").write_text("PLUGIN-TOOL-BODY\n")
+    return plugin
+
+
+def test_plugin_root_gives_the_subject_the_plugin_tree_read_only(scratch: Scratch) -> None:
+    plugin = make_plugin(scratch)
+    scratch.env["STUB_PROMPT_PATH"] = "1"
+    proc = scratch.run(
+        ["--plugin-root", str(plugin)], prompt="${CLAUDE_PLUGIN_ROOT}/scripts/tool.sh"
+    )
+    assert proc.returncode == 0, proc.stderr
+    prompt = scratch.argv()[-1]
+    assert prompt.endswith("/scripts/tool.sh")
+    assert "CLAUDE_PLUGIN_ROOT" not in prompt
+    seen_root = Path(prompt).parent.parent
+    assert seen_root.resolve() != plugin.resolve(), "the subject is not sent into the home"
+    assert scratch.recorded("promptfile") == "PLUGIN-TOOL-BODY"
+    assert scratch.recorded("promptplant") == "refused"
+    assert (plugin / "scripts" / "tool.sh").read_text() == "PLUGIN-TOOL-BODY\n"
+    assert not seen_root.exists(), "the session's copy is cleaned up after the run"
+    assert not (scratch.run_dir / "worked" / "scripts").exists()
+    assert scratch.condition() == (
+        CONDITION_HEAD
+        + "model: stub-model\n"
+        + f"plugin-root: {plugin.resolve()}\n"
+        + "resolved: stub-model-id\n"
+    )
+
+
+def test_plugin_root_resolves_every_reference_in_the_prompt(scratch: Scratch) -> None:
+    plugin = make_plugin(scratch)
+    proc = scratch.run(
+        ["--plugin-root", str(plugin)],
+        prompt="read ${CLAUDE_PLUGIN_ROOT}/a.md then ${CLAUDE_PLUGIN_ROOT}/b.md",
+    )
+    assert proc.returncode == 0, proc.stderr
+    words = scratch.argv()[-1].split(" ")
+    assert words[1].removesuffix("/a.md") == words[3].removesuffix("/b.md")
+    assert words[1].startswith("/")
+
+
+def test_without_plugin_root_the_prompt_is_passed_as_written(scratch: Scratch) -> None:
+    proc = scratch.run([], prompt="${CLAUDE_PLUGIN_ROOT}/scripts/tool.sh")
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.argv()[-1] == "${CLAUDE_PLUGIN_ROOT}/scripts/tool.sh"
+
+
+def test_missing_plugin_root_fails_before_claude(scratch: Scratch) -> None:
+    proc = scratch.run(["--plugin-root", str(scratch.root / "single-file.md")])
+    assert proc.returncode == 1
+    assert "--plugin-root directory not found" in proc.stderr
+    assert "single-file.md" in proc.stderr
     assert not scratch.claude_invoked()

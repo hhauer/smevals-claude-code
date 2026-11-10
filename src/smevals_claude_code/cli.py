@@ -73,6 +73,14 @@ result event and nothing follows for that long, the session is stopped, the run 
 result on stdout, and the ``runner_exit`` line carries ``"ended": "idle"`` so a suite can tell.
 Quiet before any result is left to ``--timeout``, because a working session is quiet too.
 
+A skill reaches its plugin's bundled scripts and references through ``${CLAUDE_PLUGIN_ROOT}``,
+which the harness replaces when it loads the skill. A subject inlined into the prompt gets no such
+replacement, and the plugin's checkout is under the home dir, out of the session's reach.
+``--plugin-root <dir>`` copies the tree into the session's own dirs, readable and not writable,
+and replaces ``${CLAUDE_PLUGIN_ROOT}`` in the prompt with the copy's path. The path differs per
+run, as the work dir's does. The variable is not put in the session's environment: the harness
+does not give it to the commands a session runs either.
+
 ``--mcp-config <file>`` is the one opt-in that changes the isolation mechanism. ``--safe-mode``
 drops every MCP server, including the ones ``--mcp-config`` names and a cwd ``.mcp.json``, and
 ``--bare`` never reads OAuth. An MCP session therefore runs with ``--setting-sources ""`` instead,
@@ -108,6 +116,9 @@ PROJECT_LABEL = "project instructions, checked into the codebase"
 # smevals write their own files beside it, never inside it.
 WORKED_DIR = "worked"
 DEFAULT_TIMEOUT_SECS = 540.0
+# What a skill writes for its plugin's install directory. The harness replaces it in a skill
+# it loads; a subject inlined into the prompt has it replaced by the runner.
+PLUGIN_ROOT_VARIABLE = "${CLAUDE_PLUGIN_ROOT}"
 # The run dir file a stream-mode session's events are recorded in, each with its arrival time.
 STREAM_FILE = "subject-stream.jsonl"
 # How often the stream reader checks whether claude has exited, and how much it reads at once.
@@ -175,6 +186,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="PATH",
         help="a host directory or file the sandboxed session may read, such as a tool "
         "installed under the home directory; repeatable",
+    )
+    parser.add_argument(
+        "--plugin-root",
+        metavar="DIR",
+        help="a plugin tree the session gets a read-only copy of; ${CLAUDE_PLUGIN_ROOT} in the "
+        "prompt becomes the copy's path",
     )
     parser.add_argument(
         "--stream",
@@ -728,6 +745,8 @@ def main(argv: list[str] | None = None) -> int:
     allow_read = [Path(allowed).resolve() for allowed in args.allow_read]
     if args.subject is not None and not Path(args.subject).is_file():
         fail(f"--subject file not found: {args.subject}")
+    if args.plugin_root is not None and not Path(args.plugin_root).is_dir():
+        fail(f"--plugin-root directory not found: {args.plugin_root}")
     mcp_config = None
     if args.mcp_config is not None:
         if not Path(args.mcp_config).is_file():
@@ -747,6 +766,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.claude_args:
         condition.append(f"claude-args: {json.dumps(args.claude_args)}\n")
     condition += [f"allow-read: {allowed}\n" for allowed in allow_read]
+    if args.plugin_root is not None:
+        condition.append(f"plugin-root: {Path(args.plugin_root).resolve()}\n")
     if args.idle_timeout is not None:
         condition.append(f"idle-timeout: {args.idle_timeout:g}\n")
     # Command substitution in the shell runners strips trailing newlines from the prompt.
@@ -798,6 +819,13 @@ def main(argv: list[str] | None = None) -> int:
             readable.append(context_file)
         if mcp_config is not None:
             readable.append(Path(mcp_config).resolve())
+        if args.plugin_root is not None:
+            # A copy, because the tree itself is usually under the home dir: opening it there
+            # would put the operator's path in the prompt and its neighbours one step away.
+            session_plugin = session_root / "plugin"
+            shutil.copytree(args.plugin_root, session_plugin, symlinks=True)
+            readable.append(session_plugin)
+            prompt = prompt.replace(PLUGIN_ROOT_VARIABLE, str(session_plugin))
         result_file = session_root / "result.json"
         cmd = [sandbox_exec, "-p", sandbox_profile(hidden, own, readable)]
         cmd += build_command(

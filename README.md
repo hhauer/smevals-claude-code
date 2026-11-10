@@ -39,6 +39,12 @@ A tool or file the subject needs from your home directory, such as a language ru
 smevals-claude-code --stage "$CORPUS" --allow-read "$HOME/.local/share/mise/installs/python"
 ```
 
+A subject whose skill text refers to its plugin's bundled files through `${CLAUDE_PLUGIN_ROOT}` names the plugin tree with `--plugin-root`. The session gets a read-only copy, and every `${CLAUDE_PLUGIN_ROOT}` in the prompt becomes the copy's path:
+
+```bash
+printf '%s' "$prompt" | smevals-claude-code --stage "$CORPUS" --plugin-root "$PLUGIN_DIR"
+```
+
 Graders read the subject's files from `worked/` in the run dir, for example `$SMEVALS_RUN_DIR/worked/report.md`.
 
 Every run writes `subject-condition.md` in the run dir: the runner and Claude Code versions, the model and effort, a SHA-256 of the assembled context, the arguments forwarded to `claude`, and each `--allow-read` grant. Every line except `resolved:` is settled before the session starts, so a suite can check a run against a record it kept from an earlier one:
