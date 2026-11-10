@@ -24,6 +24,15 @@ printf '%s' "$prompt" | smevals-claude-code \
   -- --allowedTools "Bash(rg:*)" --disallowedTools Agent
 ```
 
+House rules kept in a rules directory are added with `--rules`, placed among the `--context` flags where they load in production (after the `CLAUDE.md` beside the directory). Only the always-on rules are added, in the order Claude Code loads them; a rule with `paths:` frontmatter is left out:
+
+```bash
+smevals-claude-code \
+  --context "$HOME/.claude/CLAUDE.md" \
+  --context "$TREE/.claude/CLAUDE.md" \
+  --rules "$TREE/.claude/rules"
+```
+
 A tool or file the subject needs from your home directory, such as a language runtime installed there, is opened read-only with `--allow-read`:
 
 ```bash

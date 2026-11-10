@@ -41,7 +41,10 @@ Claude Code under the operator's tree passes each CLAUDE.md the production sessi
 read, so the files are assembled with the harness's own CLAUDE.md framing, one
 "Contents of <path> (<label>):" section per file with ``@``-imports expanded in place, and handed to
 claude as ``--append-system-prompt-file``. The assembled text is copied into the run dir as
-``subject-context.md`` so the run records what the subject saw. Every run also writes
+``subject-context.md`` so the run records what the subject saw. ``--rules`` takes a rules
+directory and adds the rules the harness loads at launch, the ones with no ``paths:``
+frontmatter, in the harness's order; it sits among the ``--context`` flags where the directory's
+rules load in production, which is after the CLAUDE.md beside it. Every run also writes
 ``subject-condition.md``: the runner version, the model and effort the session was asked for
 (under ``pinned``, the pins read from the subject) and, as ``resolved:``, the model IDs the session
 reports having used. smevals' ``run.yaml`` records only the config's alias, and aliases move. claude
@@ -123,12 +126,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="PATH",
         help="a directory staged by contents, or a file copied to the work dir root; repeatable",
     )
+    # --context and --rules fill one list, so the sections keep their command-line order.
     parser.add_argument(
         "--context",
         action="append",
         default=None,
+        type=lambda value: ("file", value),
         metavar="FILE",
         help="a CLAUDE.md the subject sees in production, in load order; repeatable",
+    )
+    parser.add_argument(
+        "--rules",
+        action="append",
+        dest="context",
+        type=lambda value: ("rules", value),
+        metavar="DIR",
+        help="a rules directory whose always-on rules the subject sees in production, placed "
+        "among the --context files in command-line order; path-scoped rules are left out; "
+        "repeatable",
     )
     parser.add_argument(
         "--subject",
@@ -188,15 +203,15 @@ def read_lines(path: Path) -> list[str]:
     return lines
 
 
-def append_context(out: list[str], path: str, label: str, home: str) -> None:
-    """Append one context file under the harness's section header.
+def append_context(out: list[str], path: str, lines: list[str], label: str, home: str) -> None:
+    """Append one context file's lines under the harness's section header.
 
     Each ``@path`` line expands into its own section in place, recursively, as the harness
     does. A missing import is a configuration error, not a subject condition to measure
     under, so it fails before claude is invoked.
     """
     out.append(f"Contents of {path} ({label}):\n\n")
-    for line in read_lines(Path(path)):
+    for line in lines:
         if line.startswith("@") and len(line) > 1:
             imported = line[1:]
             if imported.startswith("~"):
@@ -204,19 +219,55 @@ def append_context(out: list[str], path: str, label: str, home: str) -> None:
             if not Path(imported).is_file():
                 fail(f"@-import not found: {imported} (imported by {path})")
             out.append("\n")
-            append_context(out, imported, PROJECT_LABEL, home)
+            append_context(out, imported, read_lines(Path(imported)), PROJECT_LABEL, home)
         else:
             out.append(line + "\n")
     out.append("\n")
 
 
-def assemble_context(paths: list[str], home: str) -> str:
-    """Build the system-prompt text from the context files, labeled as the harness labels them."""
-    out = [FRAMING]
-    for path in paths:
-        label = GLOBAL_LABEL if path == f"{home}/.claude/CLAUDE.md" else PROJECT_LABEL
-        append_context(out, path, label, home)
-    return "".join(out)
+def split_frontmatter(lines: list[str]) -> tuple[list[str], list[str]]:
+    """Split a file's lines into the YAML frontmatter it opens with, if any, and its body."""
+    if not lines or lines[0] != "---" or "---" not in lines[1:]:
+        return [], lines
+    end = lines.index("---", 1)
+    return lines[1:end], lines[end + 1 :]
+
+
+def append_rules(out: list[str], directory: Path, home: str) -> None:
+    """Append a rules directory's always-on rules, as the harness loads them at launch.
+
+    Measured on Claude Code 2.1.321: the ``.md`` files load in the order the directory lists
+    its entries, a subdirectory's rules where the subdirectory is listed; a rule that is a
+    symlink is shown under the path it links to; and the frontmatter is not shown. A rule
+    whose frontmatter has ``paths:`` loads only once the session touches a matching file, so
+    it is not part of the context a session starts with and is left out.
+    """
+    for name in os.listdir(directory):
+        entry = directory / name
+        if entry.is_dir():
+            append_rules(out, entry, home)
+        elif name.endswith(".md"):
+            frontmatter, body = split_frontmatter(read_lines(entry))
+            if any(line.startswith("paths:") for line in frontmatter):
+                continue
+            shown = entry.resolve() if entry.is_symlink() else entry
+            append_context(out, str(shown), body, PROJECT_LABEL, home)
+
+
+def assemble_context(entries: list[tuple[str, str]], home: str) -> str | None:
+    """Build the system-prompt text from the context files, labeled as the harness labels them.
+
+    Each entry is a ``file`` or a ``rules`` directory. With no section to show, as when a
+    rules directory holds only path-scoped rules, there is no text.
+    """
+    out: list[str] = []
+    for kind, path in entries:
+        if kind == "rules":
+            append_rules(out, Path(path), home)
+        else:
+            label = GLOBAL_LABEL if path == f"{home}/.claude/CLAUDE.md" else PROJECT_LABEL
+            append_context(out, path, read_lines(Path(path)), label, home)
+    return FRAMING + "".join(out) if out else None
 
 
 def frontmatter_value(path: Path, key: str) -> str:
@@ -553,8 +604,10 @@ def main(argv: list[str] | None = None) -> int:
     if claude is None:
         fail("claude not found on PATH; install Claude Code or fix PATH")
     home = os.environ.get("HOME", "")
-    for context in args.context:
-        if not Path(context).is_file():
+    for kind, context in args.context:
+        if kind == "rules" and not Path(context).is_dir():
+            fail(f"--rules directory not found: {context}")
+        if kind == "file" and not Path(context).is_file():
             fail(f"--context file not found: {context}")
     for staged in args.stage:
         if not Path(staged).exists():
@@ -570,7 +623,7 @@ def main(argv: list[str] | None = None) -> int:
         if not Path(args.mcp_config).is_file():
             fail(f"--mcp-config file not found: {args.mcp_config}")
         mcp_config = os.path.abspath(args.mcp_config)
-    context_text = assemble_context(args.context, home) if args.context else None
+    context_text = assemble_context(args.context, home)
     model, effort = resolve_condition(config_model, args.subject)
     # Command substitution in the shell runners strips trailing newlines from the prompt.
     prompt = sys.stdin.read().rstrip("\n")

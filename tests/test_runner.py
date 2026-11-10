@@ -851,3 +851,112 @@ def test_stream_mode_stops_reading_a_process_that_keeps_writing_after_exit(
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout == "STUB-RESULT\ntwo lines\n"
     assert json.loads(scratch.stream()[-1][1]) == {"type": "runner_exit", "returncode": 0}
+
+
+def make_rules(root: Path) -> Path:
+    """A rules directory with always-on, path-scoped, nested, and non-rule files."""
+    rules = root / "rules"
+    (rules / "nested" / "deeper").mkdir(parents=True)
+    for name in ("zeta", "alpha", "mango", "kiwi", "beads", "git"):
+        (rules / f"{name}.md").write_text(f"# {name}\n\nRULE-{name}\n")
+    (rules / "fm.md").write_text("---\ndescription: other frontmatter\n---\n# fm\n\nRULE-fm\n")
+    (rules / "scoped.md").write_text('---\npaths:\n  - "**/*.py"\n---\n# scoped\n\nRULE-scoped\n')
+    (rules / "note.txt").write_text("RULE-txt\n")
+    (rules / "nested" / "n1.md").write_text("RULE-n1\n")
+    (rules / "nested" / "deeper" / "n2.md").write_text("RULE-n2\n")
+    return rules
+
+
+def rules_in_harness_order(directory: Path) -> list[Path]:
+    """Every .md file under a directory, each subdirectory expanded where it is listed."""
+    found = []
+    for name in os.listdir(directory):
+        entry = directory / name
+        if entry.is_dir():
+            found += rules_in_harness_order(entry)
+        elif name.endswith(".md"):
+            found.append(entry)
+    return found
+
+
+def test_rules_directory_adds_its_always_on_rules_in_listing_order(scratch: Scratch) -> None:
+    # Measured on Claude Code 2.1.321: the harness loads a rules directory in the order the
+    # directory lists its entries, expanding a subdirectory where it is listed, and leaves out
+    # path-scoped rules and files that are not .md.
+    rules = make_rules(scratch.root)
+    expected = [path for path in rules_in_harness_order(rules) if path.name != "scoped.md"]
+    names = [path.name for path in expected]
+    if names == sorted(names):
+        pytest.skip("this filesystem lists a directory sorted, so the order proves nothing")
+    proc = scratch.run(["--rules", str(rules)])
+    assert proc.returncode == 0, proc.stderr
+    ctx = (scratch.root / "stub-log.ctx").read_text()
+    assert ctx.startswith("Codebase and user instructions are shown below.")
+    headers = [line for line in ctx.split("\n") if line.startswith("Contents of ")]
+    assert headers == [
+        f"Contents of {path} (project instructions, checked into the codebase):"
+        for path in expected
+    ]
+    assert "RULE-scoped" not in ctx
+    assert "RULE-txt" not in ctx
+    assert (scratch.run_dir / "subject-context.md").read_text() == ctx
+
+
+def test_rule_frontmatter_is_not_shown_to_the_subject(scratch: Scratch) -> None:
+    rules = scratch.root / "rules"
+    rules.mkdir()
+    (rules / "fm.md").write_text("---\ndescription: other frontmatter\n---\n# fm\n\nRULE-fm\n")
+    proc = scratch.run(["--rules", str(rules)])
+    assert proc.returncode == 0, proc.stderr
+    ctx = (scratch.root / "stub-log.ctx").read_text()
+    assert ctx.endswith(
+        f"Contents of {rules / 'fm.md'} (project instructions, checked into the codebase):\n\n"
+        "# fm\n\nRULE-fm\n\n"
+    )
+
+
+def test_rules_and_context_keep_their_command_line_order(scratch: Scratch) -> None:
+    rules = scratch.root / "rules"
+    rules.mkdir()
+    (rules / "rule.md").write_text("RULE-BODY\n")
+    first = scratch.root / "first.md"
+    first.write_text("FIRST-BODY\n")
+    last = scratch.root / "last.md"
+    last.write_text("LAST-BODY\n")
+    proc = scratch.run(["--context", str(first), "--rules", str(rules), "--context", str(last)])
+    assert proc.returncode == 0, proc.stderr
+    ctx = (scratch.root / "stub-log.ctx").read_text()
+    assert ctx.index("FIRST-BODY") < ctx.index("RULE-BODY") < ctx.index("LAST-BODY")
+
+
+def test_a_linked_rule_is_named_by_the_file_it_links_to(scratch: Scratch) -> None:
+    # Measured on Claude Code 2.1.321: a rule that is a symlink is shown under its target's path.
+    rules = scratch.root / "rules"
+    rules.mkdir()
+    target = scratch.root / "shared" / "linked.md"
+    target.parent.mkdir()
+    target.write_text("RULE-linked\n")
+    (rules / "linked.md").symlink_to(target)
+    proc = scratch.run(["--rules", str(rules)])
+    assert proc.returncode == 0, proc.stderr
+    ctx = (scratch.root / "stub-log.ctx").read_text()
+    assert f"Contents of {target.resolve()} (project instructions" in ctx
+    assert "RULE-linked" in ctx
+
+
+def test_rules_directory_with_no_always_on_rule_adds_no_context(scratch: Scratch) -> None:
+    rules = scratch.root / "rules"
+    rules.mkdir()
+    (rules / "scoped.md").write_text('---\npaths: "**/*.py"\n---\nRULE-scoped\n')
+    proc = scratch.run(["--rules", str(rules)])
+    assert proc.returncode == 0, proc.stderr
+    assert "--append-system-prompt-file" not in scratch.argv()
+    assert not (scratch.run_dir / "subject-context.md").exists()
+
+
+def test_missing_rules_directory_fails_before_claude(scratch: Scratch) -> None:
+    proc = scratch.run(["--rules", str(scratch.root / "single-file.md")])
+    assert proc.returncode == 1
+    assert "--rules directory not found" in proc.stderr
+    assert "single-file.md" in proc.stderr
+    assert not scratch.claude_invoked()
