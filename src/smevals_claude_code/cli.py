@@ -80,7 +80,8 @@ A skill reaches its plugin's bundled scripts and references through ``${CLAUDE_P
 which the harness replaces when it loads the skill. A subject inlined into the prompt gets no such
 replacement, and the plugin's checkout is under the home dir, out of the session's reach.
 ``--plugin-root <dir>`` copies the tree into the session's own dirs, readable and not writable,
-and replaces ``${CLAUDE_PLUGIN_ROOT}`` in the prompt with the copy's path. The path differs per
+replaces ``${CLAUDE_PLUGIN_ROOT}`` in the prompt with the copy's path, and names the copy to
+claude with ``--add-dir`` so its Read tool will open it. The path differs per
 run, as the work dir's does. The variable is not put in the session's environment: the harness
 does not give it to the commands a session runs either.
 
@@ -416,6 +417,7 @@ def build_command(
     effort: str,
     mcp_config: str | None,
     context_file: Path | None,
+    plugin_dir: Path | None,
     claude_args: list[str],
     prompt: str,
     *,
@@ -423,7 +425,10 @@ def build_command(
 ) -> list[str]:
     """Assemble the claude argv: the measured condition every anchor was taken under.
 
-    A stream-mode session differs in its output format alone.
+    A stream-mode session differs in its output format alone. A session given a plugin tree
+    has it named with ``--add-dir``: claude's Read tool is refused outside the work dir
+    otherwise, whatever the sandbox allows (measured on Claude Code 2.1.321). The sandbox is
+    what keeps the tree read-only.
     """
     output_format = ["stream-json", "--verbose"] if stream else ["json"]
     if mcp_config is not None:
@@ -458,6 +463,8 @@ def build_command(
         cmd += ["--effort", effort]
     if context_file is not None:
         cmd += ["--append-system-prompt-file", str(context_file)]
+    if plugin_dir is not None:
+        cmd += ["--add-dir", str(plugin_dir)]
     cmd += claude_args
     cmd += ["--", prompt]
     return cmd
@@ -826,6 +833,7 @@ def main(argv: list[str] | None = None) -> int:
             readable.append(context_file)
         if mcp_config is not None:
             readable.append(Path(mcp_config).resolve())
+        session_plugin = None
         if args.plugin_root is not None:
             # A copy, because the tree itself is usually under the home dir: opening it there
             # would put the operator's path in the prompt and its neighbours one step away.
@@ -841,6 +849,7 @@ def main(argv: list[str] | None = None) -> int:
             effort,
             mcp_config,
             context_file,
+            session_plugin,
             args.claude_args,
             prompt,
             stream=args.stream,

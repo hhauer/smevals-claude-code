@@ -1125,6 +1125,10 @@ def test_plugin_root_gives_the_subject_the_plugin_tree_read_only(scratch: Scratc
     assert "CLAUDE_PLUGIN_ROOT" not in prompt
     seen_root = Path(prompt).parent.parent
     assert seen_root.resolve() != plugin.resolve(), "the subject is not sent into the home"
+    # Measured on Claude Code 2.1.321: a session's Read tool is refused outside its work dir
+    # unless the directory is named to claude, whatever the sandbox allows.
+    argv = scratch.argv()
+    assert argv[argv.index("--add-dir") + 1] == str(seen_root)
     assert scratch.recorded("promptfile") == "PLUGIN-TOOL-BODY"
     assert scratch.recorded("promptplant") == "refused"
     assert (plugin / "scripts" / "tool.sh").read_text() == "PLUGIN-TOOL-BODY\n"
@@ -1154,6 +1158,7 @@ def test_without_plugin_root_the_prompt_is_passed_as_written(scratch: Scratch) -
     proc = scratch.run([], prompt="${CLAUDE_PLUGIN_ROOT}/scripts/tool.sh")
     assert proc.returncode == 0, proc.stderr
     assert scratch.argv()[-1] == "${CLAUDE_PLUGIN_ROOT}/scripts/tool.sh"
+    assert "--add-dir" not in scratch.argv()
 
 
 def test_missing_plugin_root_fails_before_claude(scratch: Scratch) -> None:
