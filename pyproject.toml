@@ -1,6 +1,6 @@
 [project]
 name = "smevals-claude-code"
-version = "0.1.0"
+version = "0.2.0"
 description = "A reusable smevals Runner that drives an isolated headless Claude Code session"
 requires-python = ">= 3.15"
 

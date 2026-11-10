@@ -1,5 +1,5 @@
 # ABOUTME: The smevals-claude-code runner: stages fixtures into an isolated work dir outside any
-# ABOUTME: repo, drives a headless claude session there, and copies the worked tree back.
+# ABOUTME: repo, drives a sandboxed headless claude session there, and copies the worked tree back.
 """A reusable smevals Runner for Claude Code.
 
 The prompt is read from stdin. A ``--stage`` directory is staged by contents; a ``--stage`` file
@@ -17,9 +17,23 @@ here duplicates them.
 The subject session must not inherit the operator's ambient context. ``--safe-mode`` drops
 CLAUDE.md, plugins, hooks, and auto-memory while OAuth auth keeps working (``--bare`` would demand
 an API key); working in a temp dir outside any repo keeps a checkout's git status out of the system
-prompt. The worked tree is copied back afterwards, on failure too, for post-mortems, so graders and
-the run layout see what the session left. Residual: the harness's built-in skill listing stays
-visible; only ``--bare`` removes it.
+prompt. Residual: the harness's built-in skill listing stays visible; only ``--bare`` removes it.
+
+The subject session must not read the operator's files either: a suite's skills, fixtures, and
+checkers sit on the same disk, and a session that finds them is no longer measuring what the eval
+means to. The session runs under the macOS sandbox (``sandbox-exec``), unable to read or write
+under ``/Users``, the operator's home, the base dir that holds every run's work dir, or claude's
+shared temp dir. It is given an empty home and a temp dir of its own, so the lookups tools make
+there find nothing instead of being refused. The rest of the system stays readable, so installed
+tools work; a tool or file that lives under the home dir is opened by ``--allow-read``, read-only,
+and recorded in ``subject-condition.md``. Residual: the shared temp dirs (``/tmp`` and the
+per-user temp root) stay readable outside the runner's base dir, because shells and tools need
+them, and the login keychain stays reachable, because OAuth reads it.
+
+The worked tree is copied back afterwards, on failure too, for post-mortems, into ``worked/`` in
+the run dir. The tree is the subject's, symlinks included, and nothing else writes inside
+``worked/``: the runner's records and the files smevals writes sit beside it, where no name the
+subject chose can be in their way.
 
 ``--safe-mode`` also drops the context the subject has in production: a suite whose subject runs in
 Claude Code under the operator's tree passes each CLAUDE.md the production session loads as
@@ -227,29 +241,29 @@ def sandbox_string(path: Path) -> str:
     return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def sandbox_profile(readable: list[Path]) -> str:
-    """Write the macOS sandbox profile the session runs under: the host's files are unreadable.
+def sandbox_rule(action: str, operations: str, path: Path) -> str:
+    """Write one profile rule: a directory covers everything under it, anything else one path."""
+    scope = "subpath" if path.is_dir() else "literal"
+    return f"({action} {operations} ({scope} {sandbox_string(path)}))"
 
-    Reads are denied under every home directory, the temp root, and the shared tmp, where suites,
-    skills, checkers, and sibling runs live; the rest of the system stays readable so installed
-    tools keep working. The last matching rule wins, so each path in ``readable`` is opened again
-    after the denials: a directory with everything under it, anything else as that one path.
-    Reaching a path takes metadata on each of its parents, so those are opened for metadata only,
-    which lets a parent be traversed but not listed. Writes are not confined.
+
+def sandbox_profile(hidden: list[Path], own: list[Path], readable: list[Path]) -> str:
+    """Write the macOS sandbox profile the session runs under.
+
+    Everything is allowed except the ``hidden`` trees, where the session can neither read nor
+    write: reads are what the sandbox is for, and writes go with them because moving a file
+    reads nothing, so a hidden file could otherwise be carried into the work dir and read
+    there. The last matching rule wins, so the paths the session needs inside a hidden tree are
+    opened again afterwards: ``own`` for reading and writing, ``readable`` for reading only.
+    Reaching a path takes metadata on each of its parents, so those are opened for metadata
+    only, which lets a parent be traversed but not listed.
     """
-    denied = [
-        Path("/Users"),
-        Path.home().resolve(),
-        Path(tempfile.gettempdir()).resolve(),
-        Path("/private/tmp"),
-    ]
     lines = ["(version 1)", "(allow default)"]
-    lines += [f"(deny file-read* (subpath {sandbox_string(path)}))" for path in denied]
-    parents = sorted({parent for path in readable for parent in path.parents})
+    lines += [f"(deny file-read* file-write* (subpath {sandbox_string(path)}))" for path in hidden]
+    parents = sorted({parent for path in [*own, *readable] for parent in path.parents})
     lines += [f"(allow file-read-metadata (literal {sandbox_string(path)}))" for path in parents]
-    for path in readable:
-        scope = "subpath" if path.is_dir() else "literal"
-        lines.append(f"(allow file-read* ({scope} {sandbox_string(path)}))")
+    lines += [sandbox_rule("allow", "file-read* file-write*", path) for path in own]
+    lines += [sandbox_rule("allow", "file-read*", path) for path in readable]
     return "\n".join(lines) + "\n"
 
 
@@ -301,17 +315,30 @@ def build_command(
 
 
 def run_session(
-    cmd: list[str], work_dir: Path, session_tmp: Path, result_file: Path, timeout_secs: float
+    cmd: list[str],
+    work_dir: Path,
+    session_home: Path,
+    session_tmp: Path,
+    result_file: Path,
+    timeout_secs: float,
 ) -> int:
     """Run claude in the work dir under a watchdog; a killed session is failed, not graded.
 
     The subject session must not see smevals task metadata: scalar task fields become
     ``SMEVALS_TASK_*`` vars and can carry grading keys (a task's ``expected:``). The command
-    already holds the resolved model and effort, so nothing in the session needs them. The
-    session's temp files go to a dir of its own: the sandbox leaves the host's temp dirs
-    writable but unreadable, and claude's default temp dir is shared with every other session.
+    already holds the resolved model and effort, so nothing in the session needs them.
+
+    The session gets a home and a temp dir of its own. The sandbox answers a hidden path with
+    permission-denied, which tools treat as an error where a missing file is routine (git stops
+    on an unreadable ``~/.gitconfig``), so the session's home is an empty dir where those
+    lookups find nothing. ``XDG_*`` vars would send the same lookups back to the operator's
+    home, so they are dropped. claude's default temp dir is shared with every other session on
+    the machine, so it is pointed at the session's.
     """
-    env = {key: value for key, value in os.environ.items() if not key.startswith("SMEVALS_")}
+    env = {
+        key: value for key, value in os.environ.items() if not key.startswith(("SMEVALS_", "XDG_"))
+    }
+    env["HOME"] = str(session_home)
     env["TMPDIR"] = str(session_tmp)
     env["CLAUDE_CODE_TMPDIR"] = str(session_tmp)
     with result_file.open("wb") as out:
@@ -368,12 +395,12 @@ def main(argv: list[str] | None = None) -> int:
         fail("SMEVALS_MODEL is not set; run under smevals or export it")
     run_dir = Path.cwd()
     # smevals sets each run's cwd to its own run dir, which never carries a .git. A hand
-    # invocation from a checkout does, and the copy-back would overwrite that checkout.
-    # Refuse before anything is staged or a session is paid for.
+    # invocation from a checkout does, and the run would leave its worked tree and records in
+    # that checkout. Refuse before anything is staged or a session is paid for.
     if (run_dir / ".git").exists() or (run_dir / ".git").is_symlink():
         fail(
-            f"refusing to run in a git work-tree root: {run_dir}; the copy-back would overwrite "
-            "the checkout; run under smevals, which sets cwd to a run dir"
+            f"refusing to run in a git work-tree root: {run_dir}; the run would leave its worked "
+            "tree and records in the checkout; run under smevals, which sets cwd to a run dir"
         )
     worked = run_dir / WORKED_DIR
     if worked.exists() or worked.is_symlink():
@@ -413,36 +440,46 @@ def main(argv: list[str] | None = None) -> int:
     # Command substitution in the shell runners strips trailing newlines from the prompt.
     prompt = sys.stdin.read().rstrip("\n")
 
-    # Resolved, because the sandbox profile matches the paths the kernel resolves to.
-    work_dir = Path(tempfile.mkdtemp()).resolve()
-    session_tmp = Path(tempfile.mkdtemp()).resolve()
-    scratch = Path(tempfile.mkdtemp()).resolve()
+    # Resolved, because the sandbox profile matches the paths the kernel resolves to. Every
+    # run's dirs live under one base dir that the profile hides, so a session cannot see a
+    # sibling run; its own dirs are opened again by name.
+    operator_home = Path.home().resolve()
+    keychains = operator_home / "Library" / "Keychains"
+    base = Path(tempfile.gettempdir()).resolve() / PROG
+    base.mkdir(mode=0o700, exist_ok=True)
+    session_root = Path(tempfile.mkdtemp(dir=base))
     try:
+        work_dir = session_root / "work"
+        session_home = session_root / "home"
+        session_tmp = session_root / "tmp"
+        for directory in (work_dir, session_home / "Library", session_tmp):
+            directory.mkdir(parents=True)
+        # OAuth reads the login keychain, which is found through the home dir. A refreshed
+        # token is written back to it, so the session can write there too.
+        (session_home / "Library" / "Keychains").symlink_to(keychains)
         stage(args.stage, work_dir)
-        # What the session reads besides the system: its own dirs, the claude executable (the
-        # path it is run by and the file that resolves to), and the two files OAuth needs.
-        readable = [
-            work_dir,
-            session_tmp,
-            Path(os.path.abspath(claude)),
-            Path(claude).resolve(),
-            Path.home().resolve() / "Library" / "Keychains",
-            Path.home().resolve() / ".claude.json",
-            *allow_read,
+        hidden = [
+            Path("/Users"),
+            operator_home,
+            base,
+            Path(f"/private/tmp/claude-{os.getuid()}"),
         ]
+        own = [work_dir, session_home, session_tmp, keychains]
+        # The claude executable, by the path it is run by and the file that resolves to.
+        readable = [Path(os.path.abspath(claude)), Path(claude).resolve(), *allow_read]
         context_file = None
         if context_text is not None:
-            context_file = scratch / "context.md"
+            context_file = session_root / "context.md"
             context_file.write_text(context_text, encoding="utf-8")
             readable.append(context_file)
         if mcp_config is not None:
             readable.append(Path(mcp_config).resolve())
-        result_file = scratch / "result.json"
-        cmd = [sandbox_exec, "-p", sandbox_profile(readable)]
+        result_file = session_root / "result.json"
+        cmd = [sandbox_exec, "-p", sandbox_profile(hidden, own, readable)]
         cmd += build_command(
             claude, model, effort, mcp_config, context_file, args.claude_args, prompt
         )
-        rc = run_session(cmd, work_dir, session_tmp, result_file, args.timeout)
+        rc = run_session(cmd, work_dir, session_home, session_tmp, result_file, args.timeout)
         copy_back(work_dir, run_dir)
         if context_text is not None:
             (run_dir / "subject-context.md").write_text(context_text, encoding="utf-8")
@@ -455,6 +492,4 @@ def main(argv: list[str] | None = None) -> int:
         emit_result(result_file, condition_file)
         return rc
     finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
-        shutil.rmtree(session_tmp, ignore_errors=True)
-        shutil.rmtree(scratch, ignore_errors=True)
+        shutil.rmtree(session_root, ignore_errors=True)
