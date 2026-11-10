@@ -41,8 +41,9 @@ STREAM_LINES = [
 # handed, where the home's keychain link points, and whether a temp file round-trips. Asked for
 # stream-json it prints STUB_STREAM verbatim instead of a result record. STUB_LINGER leaves a
 # background process holding its stdout open after it exits, and STUB_FLOOD one that keeps
-# writing to it. Asked for its version it answers and does nothing else, or fails with
-# STUB_VERSION_EXIT.
+# writing to it. STUB_STREAM_WAIT keeps the session alive that long after its stream, as a
+# session waiting on a background job is, and it then prints STUB_STREAM_LATE. Asked for its
+# version it answers and does nothing else, or fails with STUB_VERSION_EXIT.
 STUB = """#!/usr/bin/env bash
 set -euo pipefail
 trap 'exit 143' TERM
@@ -113,6 +114,11 @@ if [[ -n ${STUB_FLOOD:-} ]]; then
 fi
 if [[ " $* " == *" stream-json "* ]]; then
   printf '%s' "${STUB_STREAM:-}"
+  if [[ -n ${STUB_STREAM_WAIT:-} ]]; then
+    sleep "$STUB_STREAM_WAIT" </dev/null >/dev/null 2>&1 &
+    wait "$!" || true
+    printf '%s' "${STUB_STREAM_LATE:-}"
+  fi
 elif [[ -n ${STUB_RAW:-} ]]; then
   printf '%s\\n' "$STUB_RAW"
 else
@@ -1021,3 +1027,60 @@ def test_claude_that_cannot_report_its_version_fails_before_the_session(scratch:
     assert "claude --version" in proc.stderr
     assert not scratch.claude_invoked()
     assert not (scratch.run_dir / "worked").exists()
+
+
+def result_line(text: str) -> str:
+    return json.dumps({"type": "result", "result": text, "modelUsage": {"stub-model-id": {}}})
+
+
+def test_idle_limit_ends_a_session_that_stays_quiet_after_its_result(scratch: Scratch) -> None:
+    # Measured on Claude Code 2.1.321: a session that left a command in the background prints
+    # its result, stays alive until the command ends, then takes another turn whose short
+    # message replaces the real answer.
+    scratch.env["STUB_STREAM"] = (
+        '{"type":"system","subtype":"init"}\n' + result_line("ANSWER") + "\n"
+    )
+    scratch.env["STUB_STREAM_WAIT"] = "30"
+    scratch.env["STUB_STREAM_LATE"] = result_line("the background command finished") + "\n"
+    start = time.monotonic()
+    proc = scratch.run(["--stage", str(scratch.corpus), "--stream", "--idle-timeout", "1"])
+    assert time.monotonic() - start < 15
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "ANSWER\n"
+    assert json.loads(scratch.stream()[-1][1]) == {
+        "type": "runner_exit",
+        "returncode": 0,
+        "ended": "idle",
+    }
+    assert (scratch.run_dir / "worked" / "staged" / "fixture.md").is_file()
+    assert scratch.condition() == (
+        CONDITION_HEAD + "model: stub-model\nidle-timeout: 1\nresolved: stub-model-id\n"
+    )
+
+
+def test_idle_limit_leaves_a_session_that_is_quiet_before_any_result(scratch: Scratch) -> None:
+    # A long tool call or a long reply is quiet in the stream too, and that session is working.
+    scratch.env["STUB_STREAM"] = '{"type":"system","subtype":"init"}\n'
+    scratch.env["STUB_STREAM_WAIT"] = "3"
+    scratch.env["STUB_STREAM_LATE"] = result_line("SLOW-ANSWER") + "\n"
+    proc = scratch.run(["--stage", str(scratch.corpus), "--stream", "--idle-timeout", "1"])
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "SLOW-ANSWER\n"
+    assert json.loads(scratch.stream()[-1][1]) == {"type": "runner_exit", "returncode": 0}
+
+
+def test_idle_limit_leaves_a_session_that_started_another_turn(scratch: Scratch) -> None:
+    scratch.env["STUB_STREAM"] = result_line("FIRST") + '\n{"type":"system","subtype":"init"}\n'
+    scratch.env["STUB_STREAM_WAIT"] = "3"
+    scratch.env["STUB_STREAM_LATE"] = result_line("SECOND") + "\n"
+    proc = scratch.run(["--stage", str(scratch.corpus), "--stream", "--idle-timeout", "1"])
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "SECOND\n"
+    assert json.loads(scratch.stream()[-1][1]) == {"type": "runner_exit", "returncode": 0}
+
+
+def test_idle_limit_without_stream_fails_before_claude(scratch: Scratch) -> None:
+    proc = scratch.run(["--stage", str(scratch.corpus), "--idle-timeout", "5"])
+    assert proc.returncode == 1
+    assert "--idle-timeout needs --stream" in proc.stderr
+    assert not scratch.claude_invoked()

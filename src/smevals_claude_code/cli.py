@@ -65,6 +65,14 @@ subject went quiet. claude is asked for ``--output-format stream-json --verbose`
 cannot read or edit its own stream. stdout carries the text of the stream's last result event, so
 what smevals reads is the same in both modes. Suites that pass no ``--stream`` are unaffected.
 
+A session that leaves a command running in the background prints its result and then stays
+alive until the command ends, when it takes another turn whose message becomes the last result
+(measured on Claude Code 2.1.321). The real answer is still in the stream, one result event per
+turn. ``--idle-timeout <secs>`` ends such a session instead: once the stream's latest line is a
+result event and nothing follows for that long, the session is stopped, the run exits 0 with that
+result on stdout, and the ``runner_exit`` line carries ``"ended": "idle"`` so a suite can tell.
+Quiet before any result is left to ``--timeout``, because a working session is quiet too.
+
 ``--mcp-config <file>`` is the one opt-in that changes the isolation mechanism. ``--safe-mode``
 drops every MCP server, including the ones ``--mcp-config`` names and a cwd ``.mcp.json``, and
 ``--bare`` never reads OAuth. An MCP session therefore runs with ``--setting-sources ""`` instead,
@@ -173,6 +181,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help=f"ask claude for its event stream and record each line, with the time it arrived, "
         f"in {STREAM_FILE} in the run dir",
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=None,
+        metavar="SECS",
+        help="with --stream, end a session that has printed a result and then stayed quiet this "
+        "long, as one waiting on a background command does; the run exits 0 and records the "
+        "idle end (default: no idle limit)",
     )
     parser.add_argument(
         "--timeout",
@@ -446,23 +463,78 @@ def session_env(session_home: Path, session_tmp: Path) -> dict[str, str]:
     return env
 
 
+def stop(proc: subprocess.Popen) -> None:
+    """End a session that will not end by itself: ask first, then kill."""
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def exit_code(proc: subprocess.Popen) -> int:
+    """Report a finished session's exit as a shell does: a signal death is 128 plus the signal."""
+    rc = proc.returncode
+    return 128 - rc if rc < 0 else rc
+
+
 def wait_under_watchdog(proc: subprocess.Popen, timeout_secs: float) -> int:
     """Wait for the session, killing one that outlives the timeout; return the run's exit code.
 
-    A killed session is failed, not graded: a signal death maps to 128 plus the signal number,
-    as a shell reports it.
+    A killed session is failed, not graded.
     """
     try:
         proc.wait(timeout=timeout_secs)
     except subprocess.TimeoutExpired:
-        proc.terminate()
+        stop(proc)
+    return exit_code(proc)
+
+
+class Quiet:
+    """Since when the stream's latest line has been a result event; None while it is not.
+
+    A session that has printed a result has finished a turn. One that stays alive after it is
+    waiting on work it left in the background, and any further line means another turn began.
+    """
+
+    since: float | None = None
+
+
+def is_result(line: bytes) -> bool:
+    """Tell whether a stream line is a result event."""
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return False
+    return isinstance(event, dict) and event.get("type") == "result"
+
+
+def wait_for_stream_session(
+    proc: subprocess.Popen, timeout_secs: float, idle_secs: float | None, quiet: Quiet
+) -> tuple[int, bool]:
+    """Wait for a stream-mode session; return the run's exit code and whether it ended idle.
+
+    The watchdog applies as in any session. With an idle limit, a session that has printed a
+    result and stayed quiet for the limit is ended too. That session finished its turn and has
+    its answer, so the run succeeds. Quiet before a result is not idleness: a long tool call
+    and a long reply print nothing either.
+    """
+    deadline = time.monotonic() + timeout_secs
+    while True:
         try:
-            proc.wait(timeout=10)
+            proc.wait(timeout=STREAM_POLL_SECS)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-    rc = proc.returncode
-    return 128 - rc if rc < 0 else rc
+            now = time.monotonic()
+            since = quiet.since
+            if idle_secs is not None and since is not None and now - since >= idle_secs:
+                stop(proc)
+                return 0, True
+            if now >= deadline:
+                stop(proc)
+                return exit_code(proc), False
+        else:
+            return exit_code(proc), False
 
 
 def run_session(
@@ -480,7 +552,7 @@ def stamp(log: BinaryIO, line: bytes) -> None:
     log.flush()
 
 
-def stamp_stream(stdout: BinaryIO, log: BinaryIO, exited: threading.Event) -> None:
+def stamp_stream(stdout: BinaryIO, log: BinaryIO, exited: threading.Event, quiet: Quiet) -> None:
     """Stamp each line claude prints as it arrives, until claude has exited and nothing is ready.
 
     The pipe is polled, not read to its end: a background job the subject started inherits
@@ -510,18 +582,24 @@ def stamp_stream(stdout: BinaryIO, log: BinaryIO, exited: threading.Event) -> No
             *lines, pending = (pending + chunk).split(b"\n")
             for line in lines:
                 stamp(log, line)
+                quiet.since = time.monotonic() if is_result(line) else None
     if pending:
         stamp(log, pending)
 
 
 def run_stream_session(
-    cmd: list[str], work_dir: Path, env: dict[str, str], stream_file: Path, timeout_secs: float
+    cmd: list[str],
+    work_dir: Path,
+    env: dict[str, str],
+    stream_file: Path,
+    timeout_secs: float,
+    idle_secs: float | None,
 ) -> int:
     """Run claude in the work dir under the watchdog, recording its event stream as it arrives.
 
     The runner stamps a line of its own at launch and at exit, so a reader can count the quiet
     time before the session's first event and after its last. The exit line carries the run's
-    exit code.
+    exit code and, for a session ended on the idle limit, ``"ended": "idle"``.
     """
     with stream_file.open("wb") as log:
         stamp(log, json.dumps({"type": "runner_launch"}).encode())
@@ -532,13 +610,17 @@ def run_stream_session(
         if stdout is None:
             fail("claude was started without a stdout pipe; this is a bug in the runner")
         exited = threading.Event()
-        reader = threading.Thread(target=stamp_stream, args=(stdout, log, exited))
+        quiet = Quiet()
+        reader = threading.Thread(target=stamp_stream, args=(stdout, log, exited, quiet))
         reader.start()
-        rc = wait_under_watchdog(proc, timeout_secs)
+        rc, idle = wait_for_stream_session(proc, timeout_secs, idle_secs, quiet)
         exited.set()
         reader.join()
         stdout.close()
-        stamp(log, json.dumps({"type": "runner_exit", "returncode": rc}).encode())
+        exit_line: dict[str, str | int] = {"type": "runner_exit", "returncode": rc}
+        if idle:
+            exit_line["ended"] = "idle"
+        stamp(log, json.dumps(exit_line).encode())
     return rc
 
 
@@ -629,6 +711,8 @@ def main(argv: list[str] | None = None) -> int:
     claude = shutil.which("claude")
     if claude is None:
         fail("claude not found on PATH; install Claude Code or fix PATH")
+    if args.idle_timeout is not None and not args.stream:
+        fail("--idle-timeout needs --stream: a session's quiet is read from its event stream")
     home = os.environ.get("HOME", "")
     for kind, context in args.context:
         if kind == "rules" and not Path(context).is_dir():
@@ -663,6 +747,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.claude_args:
         condition.append(f"claude-args: {json.dumps(args.claude_args)}\n")
     condition += [f"allow-read: {allowed}\n" for allowed in allow_read]
+    if args.idle_timeout is not None:
+        condition.append(f"idle-timeout: {args.idle_timeout:g}\n")
     # Command substitution in the shell runners strips trailing newlines from the prompt.
     prompt = sys.stdin.read().rstrip("\n")
 
@@ -729,7 +815,9 @@ def main(argv: list[str] | None = None) -> int:
         # record, out of the subject's reach, and it survives a session that has to be killed.
         stream_file = run_dir / STREAM_FILE
         if args.stream:
-            rc = run_stream_session(cmd, work_dir, env, stream_file, args.timeout)
+            rc = run_stream_session(
+                cmd, work_dir, env, stream_file, args.timeout, args.idle_timeout
+            )
         else:
             rc = run_session(cmd, work_dir, env, result_file, args.timeout)
         copy_back(work_dir, run_dir)

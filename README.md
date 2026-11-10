@@ -50,6 +50,14 @@ diff <(grep -v '^resolved:' anchor-condition.md) \
 
 A suite that grades what happened during the session, such as how long the subject went quiet, passes `--stream`. The runner then records every event `claude` prints in `subject-stream.jsonl` in the run dir, one `<epoch seconds> <event JSON>` line each, stamped when it arrived. The first and last lines are the runner's own, `runner_launch` and `runner_exit`.
 
+A session that leaves a command running in the background prints its answer, waits for the command, and then takes another turn whose short message replaces the answer. Every turn's result is in `subject-stream.jsonl`. To end such a session once it has answered, add `--idle-timeout`:
+
+```bash
+smevals-claude-code --stage "$CORPUS" --stream --idle-timeout 30
+```
+
+The session is stopped when it has printed a result and then stayed quiet for that many seconds. The run exits 0 with that result, and the `runner_exit` line carries `"ended": "idle"`. A session that is quiet before it has printed any result is left to `--timeout`.
+
 `smevals-claude-code --help` documents every flag.
 
 ## Development
