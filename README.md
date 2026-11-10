@@ -7,7 +7,7 @@ The session runs under the macOS sandbox, so the runner needs macOS.
 ## Install
 
 ```bash
-uv tool install "smevals-claude-code @ git+https://github.com/hhauer/smevals-claude-code@v0.5.0"
+uv tool install "smevals-claude-code @ git+https://github.com/hhauer/smevals-claude-code@v0.6.0"
 ```
 
 Pin a tag. A new version can change the `claude` command line or what the session can reach, which is the condition every eval anchor was measured under.
@@ -50,7 +50,7 @@ claude -p --safe-mode --model <model> --permission-mode acceptEdits --output-for
 ### What the subject can and cannot reach
 
 - **Hidden, for reading and writing:** `/Users`, your home directory, the run dir, every other run's work dir, and Claude Code's shared temp dir. A suite's skills, fixtures, and checkers are therefore out of reach unless staged.
-- **Its own:** the work dir, a temp dir, and a home that holds only a git config with a fixed identity (`Eval Subject <subject@example.invalid>`). A subject that commits does so under that name on every machine.
+- **Its own:** the work dir, a temp dir, and a home that holds only a git config with a fixed identity (`Eval Subject <subject@example.invalid>`). A subject that commits does so under that name on every machine. `--home-copy` adds files to that home.
 - **Still readable:** the rest of the system, so installed tools work, and the shared temp dirs (`/tmp` and the per-user temp root) outside the runner's own.
 - **Environment:** every `SMEVALS_*` and `XDG_*` variable is removed, and `HOME` and `TMPDIR` point at the session's own dirs. Anything else you export reaches the subject.
 - **Not dropped by `--safe-mode`:** the machine's managed settings. See `--hide-managed-settings`.
@@ -108,6 +108,26 @@ smevals-claude-code --stage "$CORPUS" --allow-read "$(mise where python)"
 
 The command must also be on the `PATH` the runner is started with.
 
+### Files the subject expects under `~`: `--home-copy PATH`
+
+Use it when the subject's scripts or instructions name paths under the home directory, such as a setup script that links a git hook from `~/.hooks`. The session's home is empty, and `--allow-read` does not change what `~` resolves to. Repeatable.
+
+```bash
+smevals-claude-code --stage "$CORPUS" --home-copy "$HOME/.hooks"
+```
+
+`PATH` is a file or directory under your home. Before the session starts, the runner copies it into the session's home at the same path relative to home, so the example makes `~/.hooks` exist in the session.
+
+- **Symlinks are followed.** The session gets regular files with the content and modes of what the links point at, so a tree of links into a dotfiles checkout works.
+- **The copy is read-only to the session.** In production a write there would edit your files, so the subject is refused.
+- **Nothing is copied back.** `worked/` holds the work dir only.
+- **Each entry is recorded** in `subject-condition.md` with a SHA-256 of the copied files, so an edit to one of them shows up as a changed condition.
+- **Claude Code's Read tool does not open the copy.** It refuses any path outside the work dir. Commands the subject runs, such as `cat` or a git hook, reach it.
+
+The run is refused before `claude` starts when the path is missing, is not under your home, holds a dangling symlink or a symlink loop, or would land on what the runner puts in the session's home (`.gitconfig` and `Library/`).
+
+Keep it to small configuration trees. Every run copies and hashes the whole path.
+
 ### Managed settings: `--hide-managed-settings`
 
 Use it when the subject should be measured without the machine's managed settings (`/Library/Application Support/ClaudeCode/managed-settings.json`). `--safe-mode` does not drop them: the subject runs their hooks and is allowed whatever their permission rules allow, on top of the suite's own `--allowedTools`. A suite that depends on a tool being refused needs this flag on any machine that has managed allow rules.
@@ -150,7 +170,9 @@ The exit code is the session's own. A session the watchdog killed exits non-zero
 
 ### Checking a run's condition
 
-`subject-condition.md` holds one `key: value` line for each of: the runner version, the Claude Code version, the model, the effort, a SHA-256 of the assembled context, the arguments forwarded to `claude`, each `--allow-read` grant, hidden managed settings, the plugin root, the idle limit, and, as `resolved:`, the model IDs the session reports having used. A line appears only when it applies.
+`subject-condition.md` holds one `key: value` line for each of: the runner version, the Claude Code version, the model, the effort, a SHA-256 of the assembled context, the arguments forwarded to `claude`, each `--allow-read` grant, hidden managed settings, the plugin root, each `--home-copy` entry, the idle limit, and, as `resolved:`, the model IDs the session reports having used. A line appears only when it applies.
+
+A `home-copy:` line holds the home-relative path and a digest of the files copied, for example `home-copy: .hooks sha256:<digest>`. The digest covers every file in sorted path order: its home-relative path, a NUL byte, its size in decimal, a NUL byte, and its bytes. File modes are not part of it.
 
 Every line except `resolved:` is settled before the session starts, so two runs of one condition differ in that line at most. Keep the record from the run an anchor was measured in, and a later run can be checked against it:
 

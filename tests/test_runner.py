@@ -46,7 +46,9 @@ STREAM_LINES = [
 # version it answers and does nothing else, or fails with STUB_VERSION_EXIT. STUB_PROMPT_PATH
 # treats the prompt as a path: the stub records the file's body, or that it was denied, and
 # whether it could write there. STUB_GIT_COMMIT makes a repository in the work dir and commits
-# to it, recording the author git used or that the commit failed.
+# to it, recording the author git used or that the commit failed. STUB_HOME_FILE names a path
+# under the session's home: the stub records what kind of file is there, its body, whether it
+# could write to it, and every regular file and every link the home holds.
 STUB = """#!/usr/bin/env bash
 set -euo pipefail
 trap 'exit 143' TERM
@@ -106,6 +108,22 @@ if [[ -n ${STUB_PROMPT_PATH:-} ]]; then
   else
     echo refused > "$STUB_LOG.promptplant"
   fi
+fi
+if [[ -n ${STUB_HOME_FILE:-} ]]; then
+  home_file="$HOME/$STUB_HOME_FILE"
+  kind=""
+  if [[ -L $home_file ]]; then kind="$kind link"; fi
+  if [[ -f $home_file ]]; then kind="$kind file"; fi
+  if [[ -x $home_file ]]; then kind="$kind executable"; fi
+  echo "$kind" > "$STUB_LOG.homekind"
+  cat "$home_file" > "$STUB_LOG.homefile" 2>/dev/null || echo missing > "$STUB_LOG.homefile"
+  if { echo planted >> "$home_file"; } 2>/dev/null; then
+    echo planted > "$STUB_LOG.homeplant"
+  else
+    echo refused > "$STUB_LOG.homeplant"
+  fi
+  (cd "$HOME" && find . -type f | sort) > "$STUB_LOG.homefiles"
+  (cd "$HOME" && find . -type l | sort) > "$STUB_LOG.homelinks"
 fi
 printf '%s\\n' "${HOME:-}" "${TMPDIR:-}" "${CLAUDE_CODE_TMPDIR:-}" > "$STUB_LOG.dirs"
 readlink "$HOME/Library/Keychains" > "$STUB_LOG.keychains" 2>/dev/null || true
@@ -1221,3 +1239,186 @@ def test_managed_settings_stay_readable_without_the_flag(scratch: Scratch) -> No
     assert proc.returncode == 0, proc.stderr
     assert scratch.probe() == "readable"
     assert "managed-settings" not in scratch.condition()
+
+
+# The claude command line of a run that passes no flag of the runner's that changes it.
+BASE_ARGV = [
+    "-p",
+    "--safe-mode",
+    "--model",
+    "stub-model",
+    "--permission-mode",
+    "acceptEdits",
+    "--output-format",
+    "json",
+    "--",
+]
+
+
+def make_hooks(scratch: Scratch) -> tuple[Path, Path]:
+    """A hooks tree in the operator's home, laid out the way GNU Stow lays one out.
+
+    The directory is real and the file in it is a relative symlink into a sibling tree, so a
+    link to the directory or a read grant on it reaches the link and not what it points at.
+    Returns the directory and the file the link leads to.
+    """
+    target = scratch.home / "dotfiles" / "hooks" / "python" / "pre-commit"
+    target.parent.mkdir(parents=True)
+    target.write_text("#!/bin/sh\necho HOOK-BODY\n")
+    target.chmod(0o755)
+    hooks = scratch.home / ".hooks"
+    (hooks / "python").mkdir(parents=True)
+    (hooks / "python" / "pre-commit").symlink_to("../../dotfiles/hooks/python/pre-commit")
+    return hooks, target
+
+
+def home_copy_digest(files: dict[str, bytes]) -> str:
+    """The digest the condition record carries for copied files, keyed by home-relative path.
+
+    Each file, in sorted path order, adds its path, a NUL, its size in decimal, a NUL, and
+    its bytes.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(files):
+        digest.update(path.encode() + b"\0" + str(len(files[path])).encode() + b"\0")
+        digest.update(files[path])
+    return digest.hexdigest()
+
+
+def test_home_copy_puts_the_files_behind_the_operators_links_in_the_session_home(
+    scratch: Scratch,
+) -> None:
+    hooks, target = make_hooks(scratch)
+    scratch.env["STUB_HOME_FILE"] = ".hooks/python/pre-commit"
+    proc = scratch.run(["--stage", str(scratch.corpus), "--home-copy", str(hooks)])
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == ""
+    # A regular file, not a link, and still executable: a git hook that lost its mode is skipped.
+    assert scratch.recorded("homekind") == "file executable"
+    assert scratch.recorded("homefile") == "#!/bin/sh\necho HOOK-BODY"
+    # In production a write there would edit the operator's file, so the session's is refused.
+    assert scratch.recorded("homeplant") == "refused"
+    assert target.read_text() == "#!/bin/sh\necho HOOK-BODY\n"
+    assert scratch.recorded("homefiles").splitlines() == [
+        "./.gitconfig",
+        "./.hooks/python/pre-commit",
+    ]
+    assert scratch.recorded("homelinks").splitlines() == ["./Library/Keychains"]
+    assert scratch.argv() == [*BASE_ARGV, "PROMPT-TEXT"], "the flag adds nothing to claude's argv"
+    assert not (scratch.run_dir / "worked" / ".hooks").exists(), "the copy is not copied back"
+    assert scratch.condition() == (
+        CONDITION_HEAD
+        + "model: stub-model\n"
+        + "home-copy: .hooks sha256:"
+        + home_copy_digest({".hooks/python/pre-commit": target.read_bytes()})
+        + "\n"
+        + "resolved: stub-model-id\n"
+    )
+
+
+def test_two_home_copies_under_one_parent_both_land(scratch: Scratch) -> None:
+    claude_dir = scratch.home / "Developer" / ".claude"
+    (claude_dir / "rules").mkdir(parents=True)
+    (claude_dir / "rules" / "git.md").write_text("RULE-git\n")
+    (claude_dir / "notes.md").write_text("NOTES\n")
+    (claude_dir / "left-out.md").write_text("not named by any flag\n")
+    scratch.env["STUB_HOME_FILE"] = "Developer/.claude/notes.md"
+    proc = scratch.run(
+        ["--home-copy", str(claude_dir / "rules"), "--home-copy", str(claude_dir / "notes.md")]
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.recorded("homefile") == "NOTES"
+    assert scratch.recorded("homeplant") == "refused"
+    assert scratch.recorded("homefiles").splitlines() == [
+        "./.gitconfig",
+        "./Developer/.claude/notes.md",
+        "./Developer/.claude/rules/git.md",
+    ]
+    assert scratch.condition() == (
+        CONDITION_HEAD
+        + "model: stub-model\n"
+        + "home-copy: Developer/.claude/rules sha256:"
+        + home_copy_digest({"Developer/.claude/rules/git.md": b"RULE-git\n"})
+        + "\n"
+        + "home-copy: Developer/.claude/notes.md sha256:"
+        + home_copy_digest({"Developer/.claude/notes.md": b"NOTES\n"})
+        + "\n"
+        + "resolved: stub-model-id\n"
+    )
+
+
+def test_home_copy_record_changes_when_a_copied_byte_does(scratch: Scratch) -> None:
+    # These files are part of what the subject runs. The edit is made behind the link, where
+    # nothing the suite names changes.
+    hooks, target = make_hooks(scratch)
+    lines = []
+    for body in ("echo one\n", "echo one\n", "echo two\n"):
+        target.write_text(body)
+        scratch.run_dir = scratch.root / f"run-{len(lines)}"
+        scratch.run_dir.mkdir()
+        proc = scratch.run(["--home-copy", str(hooks)])
+        assert proc.returncode == 0, proc.stderr
+        lines.append(scratch.condition())
+    assert "home-copy: .hooks sha256:" in lines[0]
+    assert lines[0] == lines[1] != lines[2]
+
+
+def dangling_link(scratch: Scratch) -> Path:
+    hooks, target = make_hooks(scratch)
+    target.unlink()
+    return hooks
+
+
+def looping_link(scratch: Scratch) -> Path:
+    hooks, _ = make_hooks(scratch)
+    (hooks / "python" / "back").symlink_to("..")
+    return hooks
+
+
+def named_pipe(scratch: Scratch) -> Path:
+    hooks, _ = make_hooks(scratch)
+    os.mkfifo(hooks / "pipe")
+    return hooks
+
+
+def runner_owned(name: str):
+    def make(scratch: Scratch) -> Path:
+        path = scratch.home / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("operator file\n")
+        return path
+
+    return make
+
+
+@pytest.mark.parametrize(
+    ("make_path", "message"),
+    [
+        pytest.param(lambda s: s.home / "no-such-hooks", "path not found", id="missing"),
+        pytest.param(
+            lambda s: s.root / "single-file.md", "not under the home directory", id="outside home"
+        ),
+        pytest.param(lambda s: s.home, "not under the home directory", id="the home itself"),
+        pytest.param(
+            lambda s: s.home / ".." / "single-file.md",
+            "not under the home directory",
+            id="climbs out of the home",
+        ),
+        pytest.param(dangling_link, "dangling symlink", id="dangling link inside"),
+        pytest.param(looping_link, "symlink loop", id="link back into its own tree"),
+        pytest.param(named_pipe, "neither a file nor a directory", id="named pipe inside"),
+        pytest.param(runner_owned(".gitconfig"), "the runner puts", id="the session's git config"),
+        pytest.param(
+            runner_owned("Library/Preferences/tool.plist"),
+            "the runner puts",
+            id="under the session's Library",
+        ),
+    ],
+)
+def test_home_copy_refusals_fail_before_claude(scratch: Scratch, make_path, message: str) -> None:
+    proc = scratch.run(["--stage", str(scratch.corpus), "--home-copy", str(make_path(scratch))])
+    assert proc.returncode == 1
+    assert proc.stderr.startswith("smevals-claude-code: --home-copy ")
+    assert message in proc.stderr
+    assert not scratch.claude_invoked()
+    assert not (scratch.run_dir / "worked").exists()

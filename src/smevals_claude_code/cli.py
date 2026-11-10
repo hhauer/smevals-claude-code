@@ -85,6 +85,18 @@ claude with ``--add-dir`` so its Read tool will open it. The path differs per
 run, as the work dir's does. The variable is not put in the session's environment: the harness
 does not give it to the commands a session runs either.
 
+A subject whose scripts name paths under the home dir finds nothing there: ``~`` is the
+session's empty home, and ``--allow-read`` opens the operator's path without changing what ``~``
+resolves to. ``--home-copy <path>`` copies a file or directory under the operator's home into
+the session's home at the same path relative to home. Symlinks are followed, because such trees
+are often farms of links into another tree under the home, which a link or a read grant would
+reach without reaching what they point at; the session gets regular files with the targets'
+content and modes. The copy is readable and not writable: in production a write there would
+edit the operator's files. It is not copied back. ``subject-condition.md`` records each entry's
+home-relative path and a SHA-256 over the copied files, because they are part of what the
+subject runs. The claude command line is unchanged, so claude's Read tool still refuses the
+copy as it does any path outside the work dir; the commands a session runs reach it.
+
 ``--safe-mode`` does not drop a machine's managed settings. A session still runs their hooks,
 is allowed what their permission rules allow whatever the suite's own ``--allowedTools`` says,
 and gets their ``env`` (measured on Claude Code 2.1.321). They sit outside the home dir, so the
@@ -136,6 +148,9 @@ PLUGIN_ROOT_VARIABLE = "${CLAUDE_PLUGIN_ROOT}"
 # The git config in the session's home. The home has none of the operator's, and git left to
 # itself makes an identity up from the login name and host name or refuses to commit.
 SESSION_GITCONFIG = "[user]\n\tname = Eval Subject\n\temail = subject@example.invalid\n"
+# What the runner itself puts in the session's home: the git config, and the directory the
+# keychain link sits in.
+SESSION_HOME_NAMES = (".gitconfig", "Library")
 # The run dir file a stream-mode session's events are recorded in, each with its arrival time.
 STREAM_FILE = "subject-stream.jsonl"
 # How often the stream reader checks whether claude has exited, and how much it reads at once.
@@ -217,6 +232,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "prompt becomes the copy's path",
     )
     parser.add_argument(
+        "--home-copy",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="a file or directory under the home directory the session gets a read-only copy "
+        "of, at the same path under its own home, with symlinks followed; repeatable",
+    )
+    parser.add_argument(
         "--stream",
         action="store_true",
         help=f"ask claude for its event stream and record each line, with the time it arrived, "
@@ -247,6 +270,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args.stage = args.stage or []
     args.context = args.context or []
     args.allow_read = args.allow_read or []
+    args.home_copy = args.home_copy or []
     return args
 
 
@@ -396,6 +420,61 @@ def stage(paths: list[str], work_dir: Path) -> None:
             shutil.copy2(source, work_dir / source.name)
 
 
+def home_copy_files(path: Path, rel: Path, ancestors: frozenset[Path]) -> list[tuple[str, Path]]:
+    """List the files a ``--home-copy`` path holds as (home-relative path, file), links followed.
+
+    The copy follows symlinks, so what it cannot follow is refused here, before anything is
+    copied: a link to nothing, a link that leads back into a directory it sits under, and
+    anything that is neither a file nor a directory.
+    """
+    if not path.exists():
+        fail(f"--home-copy found a dangling symlink: {path} -> {os.readlink(path)}")
+    if path.is_file():
+        return [(rel.as_posix(), path)]
+    if not path.is_dir():
+        fail(f"--home-copy path is neither a file nor a directory: {path}")
+    real = path.resolve()
+    if real in ancestors:
+        fail(f"--home-copy found a symlink loop: {path} leads back to {real}")
+    found = []
+    for name in os.listdir(path):
+        found += home_copy_files(path / name, rel / name, ancestors | {real})
+    return found
+
+
+def resolve_home_copy(path: str, operator_home: Path) -> tuple[Path, Path, str]:
+    """Check one ``--home-copy`` path; return it, its home-relative path, and its digest.
+
+    The home-relative path is read from the path as written, not from where it resolves to:
+    the session must find the copy where the subject's scripts look for the original. The
+    digest covers each file in sorted path order: its home-relative path, a NUL, its size in
+    decimal, a NUL, and its bytes.
+    """
+    if not os.path.lexists(path):
+        fail(f"--home-copy path not found: {path}")
+    source = Path(os.path.abspath(path))
+    if operator_home not in source.parents:
+        fail(
+            f"--home-copy path is not under the home directory {operator_home}: {path}; "
+            "the copy lands at the same path under the session's home"
+        )
+    rel = source.relative_to(operator_home)
+    if rel.parts[0] in SESSION_HOME_NAMES:
+        fail(
+            f"--home-copy path would land on {rel.parts[0]} in the session's home, which the "
+            f"runner puts there itself: {path}"
+        )
+    digest = hashlib.sha256()
+    for name, file in sorted(home_copy_files(source, rel, frozenset())):
+        try:
+            data = file.read_bytes()
+        except OSError as error:
+            fail(f"--home-copy could not read {file}: {error}")
+        digest.update(name.encode("utf-8") + b"\0" + str(len(data)).encode() + b"\0")
+        digest.update(data)
+    return source, rel, digest.hexdigest()
+
+
 def sandbox_string(path: Path) -> str:
     """Quote a path as a sandbox profile string literal."""
     return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -407,7 +486,9 @@ def sandbox_rule(action: str, operations: str, path: Path) -> str:
     return f"({action} {operations} ({scope} {sandbox_string(path)}))"
 
 
-def sandbox_profile(hidden: list[Path], own: list[Path], readable: list[Path]) -> str:
+def sandbox_profile(
+    hidden: list[Path], own: list[Path], readable: list[Path], read_only: list[Path]
+) -> str:
     """Write the macOS sandbox profile the session runs under.
 
     Everything is allowed except the ``hidden`` trees, where the session can neither read nor
@@ -416,7 +497,8 @@ def sandbox_profile(hidden: list[Path], own: list[Path], readable: list[Path]) -
     there. The last matching rule wins, so the paths the session needs inside a hidden tree are
     opened again afterwards: ``own`` for reading and writing, ``readable`` for reading only.
     Reaching a path takes metadata on each of its parents, so those are opened for metadata
-    only, which lets a parent be traversed but not listed.
+    only, which lets a parent be traversed but not listed. ``read_only`` paths sit inside an
+    ``own`` tree and are closed to writing again.
     """
     lines = ["(version 1)", "(allow default)"]
     lines += [f"(deny file-read* file-write* (subpath {sandbox_string(path)}))" for path in hidden]
@@ -424,6 +506,7 @@ def sandbox_profile(hidden: list[Path], own: list[Path], readable: list[Path]) -
     lines += [f"(allow file-read-metadata (literal {sandbox_string(path)}))" for path in parents]
     lines += [sandbox_rule("allow", "file-read* file-write*", path) for path in own]
     lines += [sandbox_rule("allow", "file-read*", path) for path in readable]
+    lines += [sandbox_rule("deny", "file-write*", path) for path in read_only]
     return "\n".join(lines) + "\n"
 
 
@@ -776,6 +859,10 @@ def main(argv: list[str] | None = None) -> int:
         fail(f"--subject file not found: {args.subject}")
     if args.plugin_root is not None and not Path(args.plugin_root).is_dir():
         fail(f"--plugin-root directory not found: {args.plugin_root}")
+    # Read from HOME as written, as the subject's scripts read it, so the path the operator
+    # names and the path the session finds agree.
+    named_home = Path(os.path.abspath(Path.home()))
+    home_copies = [resolve_home_copy(path, named_home) for path in args.home_copy]
     mcp_config = None
     if args.mcp_config is not None:
         if not Path(args.mcp_config).is_file():
@@ -799,6 +886,7 @@ def main(argv: list[str] | None = None) -> int:
         condition.append("managed-settings: hidden\n")
     if args.plugin_root is not None:
         condition.append(f"plugin-root: {Path(args.plugin_root).resolve()}\n")
+    condition += [f"home-copy: {rel} sha256:{digest}\n" for _, rel, digest in home_copies]
     if args.idle_timeout is not None:
         condition.append(f"idle-timeout: {args.idle_timeout:g}\n")
     # Command substitution in the shell runners strips trailing newlines from the prompt.
@@ -831,6 +919,18 @@ def main(argv: list[str] | None = None) -> int:
         # (measured with the security CLI on Darwin 25.6.0).
         (session_home / "Library" / "Keychains").symlink_to(keychains)
         (session_home / ".gitconfig").write_text(SESSION_GITCONFIG, encoding="utf-8")
+        # Copies, with symlinks followed: these trees are often farms of links into another
+        # tree under the home, and a link would lead the session back to what is hidden. The
+        # session's home is its own to write, so the copies are closed to writing again.
+        read_only = []
+        for source, rel, _ in home_copies:
+            copy = session_home / rel
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_dir():
+                shutil.copytree(source, copy, dirs_exist_ok=True)
+            else:
+                shutil.copy2(source, copy)
+            read_only.append(copy)
         stage(args.stage, work_dir)
         # The run dir is hidden wherever it is: it holds the runner's records of this
         # session, and its neighbours are other runs.
@@ -862,7 +962,7 @@ def main(argv: list[str] | None = None) -> int:
             readable.append(session_plugin)
             prompt = prompt.replace(PLUGIN_ROOT_VARIABLE, str(session_plugin))
         result_file = session_root / "result.json"
-        cmd = [sandbox_exec, "-p", sandbox_profile(hidden, own, readable)]
+        cmd = [sandbox_exec, "-p", sandbox_profile(hidden, own, readable, read_only)]
         cmd += build_command(
             claude,
             model,
