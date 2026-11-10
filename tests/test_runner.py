@@ -39,10 +39,11 @@ if [[ -f staged/fixture.md ]]; then
 fi
 echo "stub artifact" > stub-marker.md
 if [[ -n ${STUB_HOSTILE:-} ]]; then
-  # A subject that plants a module and squats the reserved names.
+  # A subject that plants a module and squats names the runner and smevals write later.
   printf 'raise SystemExit("hijacked json module")\\n' > json.py
   ln -s "$STUB_HOSTILE" subject-condition.md
   ln -s "$STUB_HOSTILE" subject-context.md
+  ln -s "$STUB_HOSTILE" output.txt
 fi
 if [[ -n ${STUB_RAW:-} ]]; then
   printf '%s\\n' "$STUB_RAW"
@@ -138,16 +139,16 @@ def test_isolated_session(scratch: Scratch) -> None:
     assert argv[-2:] == ["--", "PROMPT-TEXT"]
     assert not stub_pwd.exists(), "work dir cleaned up after the run"
     assert (scratch.root / "stub-log.env").read_text() == "", "no SMEVALS_* vars reach the subject"
-    fixture = scratch.run_dir / "staged" / "fixture.md"
+    fixture = scratch.run_dir / "worked" / "staged" / "fixture.md"
     assert fixture.is_file()
     assert "stub edit" in fixture.read_text()
-    assert (scratch.run_dir / "stub-marker.md").is_file()
+    assert (scratch.run_dir / "worked" / "stub-marker.md").is_file()
 
 
 def test_single_file_staging(scratch: Scratch) -> None:
     proc = scratch.run(["--stage", str(scratch.root / "single-file.md")])
     assert proc.returncode == 0
-    staged = scratch.run_dir / "single-file.md"
+    staged = scratch.run_dir / "worked" / "single-file.md"
     assert staged.is_file()
     assert "single file body" in staged.read_text()
 
@@ -156,7 +157,7 @@ def test_failing_session_propagates_exit_and_still_copies_back(scratch: Scratch)
     scratch.env["STUB_EXIT"] = "7"
     proc = scratch.run(["--stage", str(scratch.corpus)])
     assert proc.returncode == 7
-    fixture = scratch.run_dir / "staged" / "fixture.md"
+    fixture = scratch.run_dir / "worked" / "staged" / "fixture.md"
     assert fixture.is_file()
     assert "stub edit" in fixture.read_text()
 
@@ -169,7 +170,7 @@ def test_watchdog_kills_a_hung_session(scratch: Scratch) -> None:
     assert proc.returncode != 0
     assert elapsed < 20
     assert proc.stderr == ""
-    assert (scratch.run_dir / "staged" / "fixture.md").is_file()
+    assert (scratch.run_dir / "worked" / "staged" / "fixture.md").is_file()
     assert scratch.condition() == RUNNER_LINE + "model: stub-model\n"
     assert proc.stdout == ""
 
@@ -192,6 +193,22 @@ def test_hostile_worked_tree(scratch: Scratch) -> None:
     assert not context.is_symlink()
     assert context.is_file()
     assert "single file body" in context.read_text()
+    # smevals writes output.txt, stderr.txt, and run.yaml into the run dir after the runner
+    # exits; nothing the subject left may sit under a name at that level.
+    assert sorted(entry.name for entry in scratch.run_dir.iterdir()) == [
+        "subject-condition.md",
+        "subject-context.md",
+        "worked",
+    ]
+    assert (scratch.run_dir / "worked" / "output.txt").is_symlink()
+
+
+def test_refuses_a_run_dir_that_already_holds_a_worked_tree(scratch: Scratch) -> None:
+    (scratch.run_dir / "worked").mkdir()
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 1
+    assert "worked" in proc.stderr
+    assert not scratch.claude_invoked()
 
 
 def test_output_that_is_not_a_result_record_passes_through(scratch: Scratch) -> None:
@@ -416,4 +433,4 @@ def test_refuses_a_git_work_tree_root_as_the_run_dir(scratch: Scratch, make_git)
     assert proc.returncode == 1
     assert "refusing to run in a git work-tree root" in proc.stderr
     assert not scratch.claude_invoked()
-    assert not (scratch.run_dir / "staged" / "fixture.md").exists()
+    assert not (scratch.run_dir / "worked" / "staged" / "fixture.md").exists()

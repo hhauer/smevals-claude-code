@@ -63,8 +63,9 @@ FRAMING = (
 )
 GLOBAL_LABEL = "user's private global instructions for all projects"
 PROJECT_LABEL = "project instructions, checked into the codebase"
-# Written by the runner after the copy-back; a subject must not get to pre-place them.
-RESERVED_NAMES = ("subject-condition.md", "subject-context.md")
+# The run dir subdirectory the subject's worked tree is copied back into. The runner and
+# smevals write their own files beside it, never inside it.
+WORKED_DIR = "worked"
 DEFAULT_TIMEOUT_SECS = 540.0
 
 
@@ -282,22 +283,13 @@ def run_session(cmd: list[str], work_dir: Path, result_file: Path, timeout_secs:
 
 
 def copy_back(work_dir: Path, run_dir: Path) -> None:
-    """Bring the subject's worked tree into the run dir, then clear the names the runner writes.
+    """Bring the subject's worked tree into the run dir, under its own subdirectory.
 
-    The worked tree is the subject's, copied as-is. A reserved name it left there (a symlink to
-    an operator file, say) must not be followed by the writes that come next, so it is dropped
-    first.
+    The worked tree is the subject's, copied as-is, symlinks included. Nothing else writes
+    inside that subdirectory, so no name the subject left can sit where the runner or smevals
+    writes next.
     """
-    shutil.copytree(work_dir, run_dir, symlinks=True, dirs_exist_ok=True)
-    for name in RESERVED_NAMES:
-        reserved = run_dir / name
-        if reserved.is_symlink() or reserved.is_file():
-            reserved.unlink()
-        elif reserved.exists():
-            fail(
-                f"the subject left {name} as a directory in its worked tree; "
-                "refusing to overwrite it"
-            )
+    shutil.copytree(work_dir, run_dir / WORKED_DIR, symlinks=True)
 
 
 def emit_result(result_file: Path, condition_file: Path) -> None:
@@ -335,6 +327,12 @@ def main(argv: list[str] | None = None) -> int:
         fail(
             f"refusing to run in a git work-tree root: {run_dir}; the copy-back would overwrite "
             "the checkout; run under smevals, which sets cwd to a run dir"
+        )
+    worked = run_dir / WORKED_DIR
+    if worked.exists() or worked.is_symlink():
+        fail(
+            f"refusing to run in a run dir that already holds {WORKED_DIR}/: {run_dir}; "
+            "the copy-back needs that name; run under smevals, which makes a fresh run dir"
         )
     home = os.environ.get("HOME", "")
     for context in args.context:
