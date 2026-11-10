@@ -1,6 +1,7 @@
 # ABOUTME: Black-box contract tests for the smevals-claude-code runner: a stubbed claude on PATH
 # ABOUTME: records cwd, argv, and env so the isolation and condition contracts are asserted exactly.
 
+import hashlib
 import json
 import os
 import subprocess
@@ -15,7 +16,10 @@ import pytest
 # consumers invoke, never a PATH lookup that could find some other install.
 RUNNER = Path(sys.executable).parent / "smevals-claude-code"
 REPO_ROOT = Path(__file__).resolve().parent.parent
-RUNNER_LINE = f"runner: smevals-claude-code {version('smevals-claude-code')}\n"
+# The lines every condition record opens with: the runner's version and the stub's.
+CONDITION_HEAD = (
+    f"runner: smevals-claude-code {version('smevals-claude-code')}\nclaude: 9.9.9 (Stub Code)\n"
+)
 
 # What the stub prints when it is asked for stream-json: a session whose background job outlived
 # a turn, so it reports two results and the last one is the run's.
@@ -37,10 +41,19 @@ STREAM_LINES = [
 # handed, where the home's keychain link points, and whether a temp file round-trips. Asked for
 # stream-json it prints STUB_STREAM verbatim instead of a result record. STUB_LINGER leaves a
 # background process holding its stdout open after it exits, and STUB_FLOOD one that keeps
-# writing to it.
+# writing to it. STUB_STREAM_WAIT keeps the session alive that long after its stream, as a
+# session waiting on a background job is, and it then prints STUB_STREAM_LATE. Asked for its
+# version it answers and does nothing else, or fails with STUB_VERSION_EXIT. STUB_PROMPT_PATH
+# treats the prompt as a path: the stub records the file's body, or that it was denied, and
+# whether it could write there. STUB_GIT_COMMIT makes a repository in the work dir and commits
+# to it, recording the author git used or that the commit failed.
 STUB = """#!/usr/bin/env bash
 set -euo pipefail
 trap 'exit 143' TERM
+if [[ ${1:-} == --version ]]; then
+  echo "9.9.9 (Stub Code)"
+  exit "${STUB_VERSION_EXIT:-0}"
+fi
 printf '%s\\n' "$PWD" > "$STUB_LOG.pwd"
 printf '%s\\n' "$@" > "$STUB_LOG.argv"
 env | grep '^SMEVALS_' > "$STUB_LOG.env" || true
@@ -78,6 +91,22 @@ if [[ -n ${STUB_PLANT:-} ]]; then
     echo refused > "$STUB_LOG.plant"
   fi
 fi
+if [[ -n ${STUB_GIT_COMMIT:-} ]]; then
+  if git init -q repo 2>/dev/null && git -C repo commit -q --allow-empty -m probe 2>/dev/null; then
+    git -C repo log -1 --format='%an <%ae>' > "$STUB_LOG.commit"
+  else
+    echo failed > "$STUB_LOG.commit"
+  fi
+fi
+if [[ -n ${STUB_PROMPT_PATH:-} ]]; then
+  prompt_path="${*: -1}"
+  cat "$prompt_path" > "$STUB_LOG.promptfile" 2>/dev/null || echo denied > "$STUB_LOG.promptfile"
+  if { echo planted >> "$prompt_path"; } 2>/dev/null; then
+    echo planted > "$STUB_LOG.promptplant"
+  else
+    echo refused > "$STUB_LOG.promptplant"
+  fi
+fi
 printf '%s\\n' "${HOME:-}" "${TMPDIR:-}" "${CLAUDE_CODE_TMPDIR:-}" > "$STUB_LOG.dirs"
 readlink "$HOME/Library/Keychains" > "$STUB_LOG.keychains" 2>/dev/null || true
 env | grep '^XDG_' > "$STUB_LOG.xdg" || true
@@ -104,6 +133,11 @@ if [[ -n ${STUB_FLOOD:-} ]]; then
 fi
 if [[ " $* " == *" stream-json "* ]]; then
   printf '%s' "${STUB_STREAM:-}"
+  if [[ -n ${STUB_STREAM_WAIT:-} ]]; then
+    sleep "$STUB_STREAM_WAIT" </dev/null >/dev/null 2>&1 &
+    wait "$!" || true
+    printf '%s' "${STUB_STREAM_LATE:-}"
+  fi
 elif [[ -n ${STUB_RAW:-} ]]; then
   printf '%s\\n' "$STUB_RAW"
 else
@@ -205,7 +239,12 @@ def test_isolated_session(scratch: Scratch) -> None:
     assert proc.stderr == ""
     assert proc.returncode == 0
     assert proc.stdout == "STUB-RESULT\ntwo lines\n"
-    assert scratch.condition() == RUNNER_LINE + "model: stub-model\nresolved: stub-model-id\n"
+    assert scratch.condition() == (
+        CONDITION_HEAD
+        + "model: stub-model\n"
+        + 'claude-args: ["--disallowedTools", "Bash"]\n'
+        + "resolved: stub-model-id\n"
+    )
     assert scratch.claude_invoked()
     stub_pwd = Path((scratch.root / "stub-log.pwd").read_text().strip()).resolve()
     assert stub_pwd != scratch.run_dir.resolve()
@@ -338,7 +377,7 @@ def test_allow_read_opens_a_directory_and_a_file_and_is_recorded(scratch: Scratc
         assert proc.returncode == 0, proc.stderr
         assert scratch.probe() == "readable", probe
     assert scratch.condition() == (
-        RUNNER_LINE
+        CONDITION_HEAD
         + "model: stub-model\n"
         + f"allow-read: {tools.resolve()}\n"
         + f"allow-read: {lone.resolve()}\n"
@@ -453,7 +492,7 @@ def test_watchdog_kills_a_hung_session(scratch: Scratch) -> None:
     assert elapsed < 20
     assert proc.stderr == ""
     assert (scratch.run_dir / "worked" / "staged" / "fixture.md").is_file()
-    assert scratch.condition() == RUNNER_LINE + "model: stub-model\n"
+    assert scratch.condition() == CONDITION_HEAD + "model: stub-model\n"
     assert proc.stdout == ""
 
 
@@ -470,10 +509,15 @@ def test_hostile_worked_tree(scratch: Scratch) -> None:
     condition = scratch.run_dir / "subject-condition.md"
     assert not condition.is_symlink()
     assert condition.is_file()
-    assert scratch.condition() == RUNNER_LINE + "model: stub-model\nresolved: stub-model-id\n"
     context = scratch.run_dir / "subject-context.md"
     assert not context.is_symlink()
     assert context.is_file()
+    assert scratch.condition() == (
+        CONDITION_HEAD
+        + "model: stub-model\n"
+        + f"context-sha256: {hashlib.sha256(context.read_bytes()).hexdigest()}\n"
+        + "resolved: stub-model-id\n"
+    )
     assert "single file body" in context.read_text()
     # smevals writes output.txt, stderr.txt, and run.yaml into the run dir after the runner
     # exits; nothing the subject left may sit under a name at that level.
@@ -498,7 +542,7 @@ def test_output_that_is_not_a_result_record_passes_through(scratch: Scratch) -> 
     proc = scratch.run(["--stage", str(scratch.corpus)])
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout == "not a result record\n"
-    assert scratch.condition() == RUNNER_LINE + "model: stub-model\n"
+    assert scratch.condition() == CONDITION_HEAD + "model: stub-model\n"
 
 
 def test_missing_smevals_model_fails_fast(scratch: Scratch) -> None:
@@ -615,7 +659,7 @@ def test_pinned_resolves_model_and_effort_from_the_subject(scratch: Scratch) -> 
     assert argv[argv.index("--effort") + 1] == "medium"
     assert (
         scratch.condition()
-        == RUNNER_LINE + "model: opus\neffort: medium\nresolved: stub-model-id\n"
+        == CONDITION_HEAD + "model: opus\neffort: medium\nresolved: stub-model-id\n"
     )
 
 
@@ -625,7 +669,7 @@ def test_pinned_subject_without_effort_records_no_effort_line(scratch: Scratch) 
     scratch.env["SMEVALS_MODEL"] = "pinned"
     proc = scratch.run(["--subject", str(subject), "--stage", str(scratch.corpus)])
     assert proc.returncode == 0
-    assert scratch.condition() == RUNNER_LINE + "model: opus\nresolved: stub-model-id\n"
+    assert scratch.condition() == CONDITION_HEAD + "model: opus\nresolved: stub-model-id\n"
 
 
 def test_subject_alone_changes_nothing(scratch: Scratch) -> None:
@@ -635,7 +679,7 @@ def test_subject_alone_changes_nothing(scratch: Scratch) -> None:
     argv = scratch.argv()
     assert argv[argv.index("--model") + 1] == "stub-model"
     assert "--effort" not in argv
-    assert scratch.condition() == RUNNER_LINE + "model: stub-model\nresolved: stub-model-id\n"
+    assert scratch.condition() == CONDITION_HEAD + "model: stub-model\nresolved: stub-model-id\n"
 
 
 def test_pinned_without_subject_fails_naming_the_flag(scratch: Scratch) -> None:
@@ -773,7 +817,7 @@ def test_stream_mode_reports_the_last_result(scratch: Scratch) -> None:
     assert proc.returncode == 0, proc.stderr
     assert proc.stderr == ""
     assert proc.stdout == "STUB-RESULT\ntwo lines\n"
-    assert scratch.condition() == RUNNER_LINE + "model: stub-model\nresolved: stub-model-id\n"
+    assert scratch.condition() == CONDITION_HEAD + "model: stub-model\nresolved: stub-model-id\n"
 
 
 def test_stream_file_sits_beside_the_worked_tree_not_in_it(scratch: Scratch) -> None:
@@ -793,7 +837,7 @@ def test_stream_with_no_result_event_prints_nothing_and_says_so(scratch: Scratch
     assert proc.returncode == 0
     assert proc.stdout == ""
     assert "no result event" in proc.stderr
-    assert scratch.condition() == RUNNER_LINE + "model: stub-model\n"
+    assert scratch.condition() == CONDITION_HEAD + "model: stub-model\n"
     assert [body for _, body in scratch.stream()][1:-1] == [
         '{"type":"system","subtype":"init"}',
         "not json at all",
@@ -851,3 +895,288 @@ def test_stream_mode_stops_reading_a_process_that_keeps_writing_after_exit(
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout == "STUB-RESULT\ntwo lines\n"
     assert json.loads(scratch.stream()[-1][1]) == {"type": "runner_exit", "returncode": 0}
+
+
+def make_rules(root: Path) -> Path:
+    """A rules directory with always-on, path-scoped, nested, and non-rule files."""
+    rules = root / "rules"
+    (rules / "nested" / "deeper").mkdir(parents=True)
+    for name in ("zeta", "alpha", "mango", "kiwi", "beads", "git"):
+        (rules / f"{name}.md").write_text(f"# {name}\n\nRULE-{name}\n")
+    (rules / "fm.md").write_text("---\ndescription: other frontmatter\n---\n# fm\n\nRULE-fm\n")
+    (rules / "scoped.md").write_text('---\npaths:\n  - "**/*.py"\n---\n# scoped\n\nRULE-scoped\n')
+    (rules / "note.txt").write_text("RULE-txt\n")
+    (rules / "nested" / "n1.md").write_text("RULE-n1\n")
+    (rules / "nested" / "deeper" / "n2.md").write_text("RULE-n2\n")
+    return rules
+
+
+def rules_in_harness_order(directory: Path) -> list[Path]:
+    """Every .md file under a directory, each subdirectory expanded where it is listed."""
+    found = []
+    for name in os.listdir(directory):
+        entry = directory / name
+        if entry.is_dir():
+            found += rules_in_harness_order(entry)
+        elif name.endswith(".md"):
+            found.append(entry)
+    return found
+
+
+def test_rules_directory_adds_its_always_on_rules_in_listing_order(scratch: Scratch) -> None:
+    # Measured on Claude Code 2.1.321: the harness loads a rules directory in the order the
+    # directory lists its entries, expanding a subdirectory where it is listed, and leaves out
+    # path-scoped rules and files that are not .md.
+    rules = make_rules(scratch.root)
+    expected = [path for path in rules_in_harness_order(rules) if path.name != "scoped.md"]
+    names = [path.name for path in expected]
+    if names == sorted(names):
+        pytest.skip("this filesystem lists a directory sorted, so the order proves nothing")
+    proc = scratch.run(["--rules", str(rules)])
+    assert proc.returncode == 0, proc.stderr
+    ctx = (scratch.root / "stub-log.ctx").read_text()
+    assert ctx.startswith("Codebase and user instructions are shown below.")
+    headers = [line for line in ctx.split("\n") if line.startswith("Contents of ")]
+    assert headers == [
+        f"Contents of {path} (project instructions, checked into the codebase):"
+        for path in expected
+    ]
+    assert "RULE-scoped" not in ctx
+    assert "RULE-txt" not in ctx
+    assert (scratch.run_dir / "subject-context.md").read_text() == ctx
+
+
+def test_rule_frontmatter_is_not_shown_to_the_subject(scratch: Scratch) -> None:
+    rules = scratch.root / "rules"
+    rules.mkdir()
+    (rules / "fm.md").write_text("---\ndescription: other frontmatter\n---\n# fm\n\nRULE-fm\n")
+    proc = scratch.run(["--rules", str(rules)])
+    assert proc.returncode == 0, proc.stderr
+    ctx = (scratch.root / "stub-log.ctx").read_text()
+    assert ctx.endswith(
+        f"Contents of {rules / 'fm.md'} (project instructions, checked into the codebase):\n\n"
+        "# fm\n\nRULE-fm\n\n"
+    )
+
+
+def test_rules_and_context_keep_their_command_line_order(scratch: Scratch) -> None:
+    rules = scratch.root / "rules"
+    rules.mkdir()
+    (rules / "rule.md").write_text("RULE-BODY\n")
+    first = scratch.root / "first.md"
+    first.write_text("FIRST-BODY\n")
+    last = scratch.root / "last.md"
+    last.write_text("LAST-BODY\n")
+    proc = scratch.run(["--context", str(first), "--rules", str(rules), "--context", str(last)])
+    assert proc.returncode == 0, proc.stderr
+    ctx = (scratch.root / "stub-log.ctx").read_text()
+    assert ctx.index("FIRST-BODY") < ctx.index("RULE-BODY") < ctx.index("LAST-BODY")
+
+
+def test_a_linked_rule_is_named_by_the_file_it_links_to(scratch: Scratch) -> None:
+    # Measured on Claude Code 2.1.321: a rule that is a symlink is shown under its target's path.
+    rules = scratch.root / "rules"
+    rules.mkdir()
+    target = scratch.root / "shared" / "linked.md"
+    target.parent.mkdir()
+    target.write_text("RULE-linked\n")
+    (rules / "linked.md").symlink_to(target)
+    proc = scratch.run(["--rules", str(rules)])
+    assert proc.returncode == 0, proc.stderr
+    ctx = (scratch.root / "stub-log.ctx").read_text()
+    assert f"Contents of {target.resolve()} (project instructions" in ctx
+    assert "RULE-linked" in ctx
+
+
+def test_rules_directory_with_no_always_on_rule_adds_no_context(scratch: Scratch) -> None:
+    rules = scratch.root / "rules"
+    rules.mkdir()
+    (rules / "scoped.md").write_text('---\npaths: "**/*.py"\n---\nRULE-scoped\n')
+    proc = scratch.run(["--rules", str(rules)])
+    assert proc.returncode == 0, proc.stderr
+    assert "--append-system-prompt-file" not in scratch.argv()
+    assert not (scratch.run_dir / "subject-context.md").exists()
+
+
+def test_missing_rules_directory_fails_before_claude(scratch: Scratch) -> None:
+    proc = scratch.run(["--rules", str(scratch.root / "single-file.md")])
+    assert proc.returncode == 1
+    assert "--rules directory not found" in proc.stderr
+    assert "single-file.md" in proc.stderr
+    assert not scratch.claude_invoked()
+
+
+def test_condition_tells_two_contexts_apart(scratch: Scratch) -> None:
+    # A suite whose context shrinks without any of its own files changing sees it here.
+    context = scratch.root / "single-file.md"
+    hashes = []
+    for body in ("house rules\n", "house rules\n", "fewer rules\n"):
+        context.write_text(body)
+        scratch.run_dir = scratch.root / f"run-{len(hashes)}"
+        scratch.run_dir.mkdir()
+        proc = scratch.run(["--context", str(context)])
+        assert proc.returncode == 0, proc.stderr
+        assembled = (scratch.run_dir / "subject-context.md").read_bytes()
+        line = f"context-sha256: {hashlib.sha256(assembled).hexdigest()}\n"
+        assert line in scratch.condition()
+        hashes.append(line)
+    assert hashes[0] == hashes[1] != hashes[2]
+
+
+def test_condition_without_context_has_no_context_hash(scratch: Scratch) -> None:
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 0, proc.stderr
+    assert "context-sha256" not in scratch.condition()
+
+
+def test_condition_is_complete_for_a_session_that_had_to_be_killed(scratch: Scratch) -> None:
+    # Everything but the resolved line is known before the session starts.
+    scratch.env["STUB_SLEEP"] = "30"
+    proc = scratch.run(["--timeout", "1", "--", "--disallowedTools", "Bash"])
+    assert proc.returncode != 0
+    assert scratch.condition() == (
+        CONDITION_HEAD + 'model: stub-model\nclaude-args: ["--disallowedTools", "Bash"]\n'
+    )
+
+
+def test_claude_that_cannot_report_its_version_fails_before_the_session(scratch: Scratch) -> None:
+    scratch.env["STUB_VERSION_EXIT"] = "3"
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 1
+    assert "claude --version" in proc.stderr
+    assert not scratch.claude_invoked()
+    assert not (scratch.run_dir / "worked").exists()
+
+
+def result_line(text: str) -> str:
+    return json.dumps({"type": "result", "result": text, "modelUsage": {"stub-model-id": {}}})
+
+
+def test_idle_limit_ends_a_session_that_stays_quiet_after_its_result(scratch: Scratch) -> None:
+    # Measured on Claude Code 2.1.321: a session that left a command in the background prints
+    # its result, stays alive until the command ends, then takes another turn whose short
+    # message replaces the real answer.
+    scratch.env["STUB_STREAM"] = (
+        '{"type":"system","subtype":"init"}\n' + result_line("ANSWER") + "\n"
+    )
+    scratch.env["STUB_STREAM_WAIT"] = "30"
+    scratch.env["STUB_STREAM_LATE"] = result_line("the background command finished") + "\n"
+    start = time.monotonic()
+    proc = scratch.run(["--stage", str(scratch.corpus), "--stream", "--idle-timeout", "1"])
+    assert time.monotonic() - start < 15
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "ANSWER\n"
+    assert json.loads(scratch.stream()[-1][1]) == {
+        "type": "runner_exit",
+        "returncode": 0,
+        "ended": "idle",
+    }
+    assert (scratch.run_dir / "worked" / "staged" / "fixture.md").is_file()
+    assert scratch.condition() == (
+        CONDITION_HEAD + "model: stub-model\nidle-timeout: 1\nresolved: stub-model-id\n"
+    )
+
+
+def test_idle_limit_leaves_a_session_that_is_quiet_before_any_result(scratch: Scratch) -> None:
+    # A long tool call or a long reply is quiet in the stream too, and that session is working.
+    scratch.env["STUB_STREAM"] = '{"type":"system","subtype":"init"}\n'
+    scratch.env["STUB_STREAM_WAIT"] = "3"
+    scratch.env["STUB_STREAM_LATE"] = result_line("SLOW-ANSWER") + "\n"
+    proc = scratch.run(["--stage", str(scratch.corpus), "--stream", "--idle-timeout", "1"])
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "SLOW-ANSWER\n"
+    assert json.loads(scratch.stream()[-1][1]) == {"type": "runner_exit", "returncode": 0}
+
+
+def test_idle_limit_leaves_a_session_that_started_another_turn(scratch: Scratch) -> None:
+    scratch.env["STUB_STREAM"] = result_line("FIRST") + '\n{"type":"system","subtype":"init"}\n'
+    scratch.env["STUB_STREAM_WAIT"] = "3"
+    scratch.env["STUB_STREAM_LATE"] = result_line("SECOND") + "\n"
+    proc = scratch.run(["--stage", str(scratch.corpus), "--stream", "--idle-timeout", "1"])
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "SECOND\n"
+    assert json.loads(scratch.stream()[-1][1]) == {"type": "runner_exit", "returncode": 0}
+
+
+def test_idle_limit_without_stream_fails_before_claude(scratch: Scratch) -> None:
+    proc = scratch.run(["--stage", str(scratch.corpus), "--idle-timeout", "5"])
+    assert proc.returncode == 1
+    assert "--idle-timeout needs --stream" in proc.stderr
+    assert not scratch.claude_invoked()
+
+
+def make_plugin(scratch: Scratch) -> Path:
+    """A plugin tree in the operator's home, where the sandboxed session cannot read it."""
+    plugin = scratch.home / "plugins" / "demo"
+    (plugin / "scripts").mkdir(parents=True)
+    (plugin / "scripts" / "tool.sh").write_text("PLUGIN-TOOL-BODY\n")
+    return plugin
+
+
+def test_plugin_root_gives_the_subject_the_plugin_tree_read_only(scratch: Scratch) -> None:
+    plugin = make_plugin(scratch)
+    scratch.env["STUB_PROMPT_PATH"] = "1"
+    proc = scratch.run(
+        ["--plugin-root", str(plugin)], prompt="${CLAUDE_PLUGIN_ROOT}/scripts/tool.sh"
+    )
+    assert proc.returncode == 0, proc.stderr
+    prompt = scratch.argv()[-1]
+    assert prompt.endswith("/scripts/tool.sh")
+    assert "CLAUDE_PLUGIN_ROOT" not in prompt
+    seen_root = Path(prompt).parent.parent
+    assert seen_root.resolve() != plugin.resolve(), "the subject is not sent into the home"
+    # Measured on Claude Code 2.1.321: a session's Read tool is refused outside its work dir
+    # unless the directory is named to claude, whatever the sandbox allows.
+    argv = scratch.argv()
+    assert argv[argv.index("--add-dir") + 1] == str(seen_root)
+    assert scratch.recorded("promptfile") == "PLUGIN-TOOL-BODY"
+    assert scratch.recorded("promptplant") == "refused"
+    assert (plugin / "scripts" / "tool.sh").read_text() == "PLUGIN-TOOL-BODY\n"
+    assert not seen_root.exists(), "the session's copy is cleaned up after the run"
+    assert not (scratch.run_dir / "worked" / "scripts").exists()
+    assert scratch.condition() == (
+        CONDITION_HEAD
+        + "model: stub-model\n"
+        + f"plugin-root: {plugin.resolve()}\n"
+        + "resolved: stub-model-id\n"
+    )
+
+
+def test_plugin_root_resolves_every_reference_in_the_prompt(scratch: Scratch) -> None:
+    plugin = make_plugin(scratch)
+    proc = scratch.run(
+        ["--plugin-root", str(plugin)],
+        prompt="read ${CLAUDE_PLUGIN_ROOT}/a.md then ${CLAUDE_PLUGIN_ROOT}/b.md",
+    )
+    assert proc.returncode == 0, proc.stderr
+    words = scratch.argv()[-1].split(" ")
+    assert words[1].removesuffix("/a.md") == words[3].removesuffix("/b.md")
+    assert words[1].startswith("/")
+
+
+def test_without_plugin_root_the_prompt_is_passed_as_written(scratch: Scratch) -> None:
+    proc = scratch.run([], prompt="${CLAUDE_PLUGIN_ROOT}/scripts/tool.sh")
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.argv()[-1] == "${CLAUDE_PLUGIN_ROOT}/scripts/tool.sh"
+    assert "--add-dir" not in scratch.argv()
+
+
+def test_missing_plugin_root_fails_before_claude(scratch: Scratch) -> None:
+    proc = scratch.run(["--plugin-root", str(scratch.root / "single-file.md")])
+    assert proc.returncode == 1
+    assert "--plugin-root directory not found" in proc.stderr
+    assert "single-file.md" in proc.stderr
+    assert not scratch.claude_invoked()
+
+
+def test_subject_can_commit_in_its_empty_home(scratch: Scratch) -> None:
+    # The session's home has none of the operator's git config. Left to itself git makes an
+    # identity up from the login name and the host name, or refuses the commit where it cannot
+    # (measured on git 2.56.0 on Darwin 25.6.0: it made one up). The runner gives the session an
+    # identity of its own, the same in every run and on every machine.
+    for name in [key for key in scratch.env if key.startswith("GIT_")]:
+        del scratch.env[name]
+    scratch.env["STUB_GIT_COMMIT"] = "1"
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.recorded("commit") == "Eval Subject <subject@example.invalid>"
