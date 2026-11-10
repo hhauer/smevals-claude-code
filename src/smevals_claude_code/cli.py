@@ -45,9 +45,13 @@ claude as ``--append-system-prompt-file``. The assembled text is copied into the
 directory and adds the rules the harness loads at launch, the ones with no ``paths:``
 frontmatter, in the harness's order; it sits among the ``--context`` flags where the directory's
 rules load in production, which is after the CLAUDE.md beside it. Every run also writes
-``subject-condition.md``: the runner version, the model and effort the session was asked for
-(under ``pinned``, the pins read from the subject) and, as ``resolved:``, the model IDs the session
-reports having used. smevals' ``run.yaml`` records only the config's alias, and aliases move. claude
+``subject-condition.md``: the runner version, the Claude Code version, the model and effort the
+session was asked for (under ``pinned``, the pins read from the subject), a SHA-256 of the
+assembled context, the arguments forwarded to claude, each ``--allow-read`` grant and, as
+``resolved:``, the model IDs the session reports having used. Every line but ``resolved:`` is
+settled before the session starts, so two runs of one condition differ in that line at most and a
+suite can compare a run against a record it kept. smevals' ``run.yaml`` records only the config's
+alias, and aliases move. claude
 runs with ``--output-format json`` so the session reports those IDs; the runner prints the record's
 result text to stdout exactly as text mode would, so what smevals reads is unchanged. Output that
 is not a result record (a watchdog-killed session) passes through verbatim and gets no resolved
@@ -70,6 +74,7 @@ reaches only the servers the file names, never a user-scope production server. S
 """
 
 import argparse
+import hashlib
 import json
 import os
 import selectors
@@ -301,6 +306,27 @@ def resolve_condition(config_model: str, subject: str | None) -> tuple[str, str]
     if not model:
         fail(f"no model: pin in the frontmatter of {subject}")
     return model, frontmatter_value(Path(subject), "effort")
+
+
+def claude_version(claude: str) -> str:
+    """Ask claude for its version, which is part of the condition a session runs under."""
+    try:
+        proc = subprocess.run(
+            [claude, "--version"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        fail(f"claude --version did not run: {error}; the run records the version it measured")
+    if proc.returncode != 0 or not proc.stdout.strip():
+        fail(
+            f"claude --version exited {proc.returncode} with {proc.stderr.strip()!r}; "
+            "the run records the version it measured, so fix the claude install first"
+        )
+    return proc.stdout.strip()
 
 
 def stage(paths: list[str], work_dir: Path) -> None:
@@ -625,6 +651,18 @@ def main(argv: list[str] | None = None) -> int:
         mcp_config = os.path.abspath(args.mcp_config)
     context_text = assemble_context(args.context, home)
     model, effort = resolve_condition(config_model, args.subject)
+    # Everything in the condition record but the models the session reports is known here,
+    # before the session starts, so two runs of one condition differ in that line at most.
+    condition = [f"runner: {PROG} {version(PROG)}\n", f"claude: {claude_version(claude)}\n"]
+    condition.append(f"model: {model}\n")
+    if effort:
+        condition.append(f"effort: {effort}\n")
+    if context_text is not None:
+        digest = hashlib.sha256(context_text.encode("utf-8")).hexdigest()
+        condition.append(f"context-sha256: {digest}\n")
+    if args.claude_args:
+        condition.append(f"claude-args: {json.dumps(args.claude_args)}\n")
+    condition += [f"allow-read: {allowed}\n" for allowed in allow_read]
     # Command substitution in the shell runners strips trailing newlines from the prompt.
     prompt = sys.stdin.read().rstrip("\n")
 
@@ -698,11 +736,7 @@ def main(argv: list[str] | None = None) -> int:
         if context_text is not None:
             (run_dir / "subject-context.md").write_text(context_text, encoding="utf-8")
         condition_file = run_dir / "subject-condition.md"
-        lines = [f"runner: {PROG} {version(PROG)}\n", f"model: {model}\n"]
-        if effort:
-            lines.append(f"effort: {effort}\n")
-        lines += [f"allow-read: {allowed}\n" for allowed in allow_read]
-        condition_file.write_text("".join(lines), encoding="utf-8")
+        condition_file.write_text("".join(condition), encoding="utf-8")
         if args.stream:
             emit_stream_result(stream_file, condition_file)
         else:

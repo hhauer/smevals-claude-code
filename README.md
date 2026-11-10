@@ -41,6 +41,13 @@ smevals-claude-code --stage "$CORPUS" --allow-read "$HOME/.local/share/mise/inst
 
 Graders read the subject's files from `worked/` in the run dir, for example `$SMEVALS_RUN_DIR/worked/report.md`.
 
+Every run writes `subject-condition.md` in the run dir: the runner and Claude Code versions, the model and effort, a SHA-256 of the assembled context, the arguments forwarded to `claude`, and each `--allow-read` grant. Every line except `resolved:` is settled before the session starts, so a suite can check a run against a record it kept from an earlier one:
+
+```bash
+diff <(grep -v '^resolved:' anchor-condition.md) \
+     <(grep -v '^resolved:' "$SMEVALS_RUN_DIR/subject-condition.md")
+```
+
 A suite that grades what happened during the session, such as how long the subject went quiet, passes `--stream`. The runner then records every event `claude` prints in `subject-stream.jsonl` in the run dir, one `<epoch seconds> <event JSON>` line each, stamped when it arrived. The first and last lines are the runner's own, `runner_launch` and `runner_exit`.
 
 `smevals-claude-code --help` documents every flag.

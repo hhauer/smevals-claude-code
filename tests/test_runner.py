@@ -1,6 +1,7 @@
 # ABOUTME: Black-box contract tests for the smevals-claude-code runner: a stubbed claude on PATH
 # ABOUTME: records cwd, argv, and env so the isolation and condition contracts are asserted exactly.
 
+import hashlib
 import json
 import os
 import subprocess
@@ -15,7 +16,10 @@ import pytest
 # consumers invoke, never a PATH lookup that could find some other install.
 RUNNER = Path(sys.executable).parent / "smevals-claude-code"
 REPO_ROOT = Path(__file__).resolve().parent.parent
-RUNNER_LINE = f"runner: smevals-claude-code {version('smevals-claude-code')}\n"
+# The lines every condition record opens with: the runner's version and the stub's.
+CONDITION_HEAD = (
+    f"runner: smevals-claude-code {version('smevals-claude-code')}\nclaude: 9.9.9 (Stub Code)\n"
+)
 
 # What the stub prints when it is asked for stream-json: a session whose background job outlived
 # a turn, so it reports two results and the last one is the run's.
@@ -37,10 +41,15 @@ STREAM_LINES = [
 # handed, where the home's keychain link points, and whether a temp file round-trips. Asked for
 # stream-json it prints STUB_STREAM verbatim instead of a result record. STUB_LINGER leaves a
 # background process holding its stdout open after it exits, and STUB_FLOOD one that keeps
-# writing to it.
+# writing to it. Asked for its version it answers and does nothing else, or fails with
+# STUB_VERSION_EXIT.
 STUB = """#!/usr/bin/env bash
 set -euo pipefail
 trap 'exit 143' TERM
+if [[ ${1:-} == --version ]]; then
+  echo "9.9.9 (Stub Code)"
+  exit "${STUB_VERSION_EXIT:-0}"
+fi
 printf '%s\\n' "$PWD" > "$STUB_LOG.pwd"
 printf '%s\\n' "$@" > "$STUB_LOG.argv"
 env | grep '^SMEVALS_' > "$STUB_LOG.env" || true
@@ -205,7 +214,12 @@ def test_isolated_session(scratch: Scratch) -> None:
     assert proc.stderr == ""
     assert proc.returncode == 0
     assert proc.stdout == "STUB-RESULT\ntwo lines\n"
-    assert scratch.condition() == RUNNER_LINE + "model: stub-model\nresolved: stub-model-id\n"
+    assert scratch.condition() == (
+        CONDITION_HEAD
+        + "model: stub-model\n"
+        + 'claude-args: ["--disallowedTools", "Bash"]\n'
+        + "resolved: stub-model-id\n"
+    )
     assert scratch.claude_invoked()
     stub_pwd = Path((scratch.root / "stub-log.pwd").read_text().strip()).resolve()
     assert stub_pwd != scratch.run_dir.resolve()
@@ -338,7 +352,7 @@ def test_allow_read_opens_a_directory_and_a_file_and_is_recorded(scratch: Scratc
         assert proc.returncode == 0, proc.stderr
         assert scratch.probe() == "readable", probe
     assert scratch.condition() == (
-        RUNNER_LINE
+        CONDITION_HEAD
         + "model: stub-model\n"
         + f"allow-read: {tools.resolve()}\n"
         + f"allow-read: {lone.resolve()}\n"
@@ -453,7 +467,7 @@ def test_watchdog_kills_a_hung_session(scratch: Scratch) -> None:
     assert elapsed < 20
     assert proc.stderr == ""
     assert (scratch.run_dir / "worked" / "staged" / "fixture.md").is_file()
-    assert scratch.condition() == RUNNER_LINE + "model: stub-model\n"
+    assert scratch.condition() == CONDITION_HEAD + "model: stub-model\n"
     assert proc.stdout == ""
 
 
@@ -470,10 +484,15 @@ def test_hostile_worked_tree(scratch: Scratch) -> None:
     condition = scratch.run_dir / "subject-condition.md"
     assert not condition.is_symlink()
     assert condition.is_file()
-    assert scratch.condition() == RUNNER_LINE + "model: stub-model\nresolved: stub-model-id\n"
     context = scratch.run_dir / "subject-context.md"
     assert not context.is_symlink()
     assert context.is_file()
+    assert scratch.condition() == (
+        CONDITION_HEAD
+        + "model: stub-model\n"
+        + f"context-sha256: {hashlib.sha256(context.read_bytes()).hexdigest()}\n"
+        + "resolved: stub-model-id\n"
+    )
     assert "single file body" in context.read_text()
     # smevals writes output.txt, stderr.txt, and run.yaml into the run dir after the runner
     # exits; nothing the subject left may sit under a name at that level.
@@ -498,7 +517,7 @@ def test_output_that_is_not_a_result_record_passes_through(scratch: Scratch) -> 
     proc = scratch.run(["--stage", str(scratch.corpus)])
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout == "not a result record\n"
-    assert scratch.condition() == RUNNER_LINE + "model: stub-model\n"
+    assert scratch.condition() == CONDITION_HEAD + "model: stub-model\n"
 
 
 def test_missing_smevals_model_fails_fast(scratch: Scratch) -> None:
@@ -615,7 +634,7 @@ def test_pinned_resolves_model_and_effort_from_the_subject(scratch: Scratch) -> 
     assert argv[argv.index("--effort") + 1] == "medium"
     assert (
         scratch.condition()
-        == RUNNER_LINE + "model: opus\neffort: medium\nresolved: stub-model-id\n"
+        == CONDITION_HEAD + "model: opus\neffort: medium\nresolved: stub-model-id\n"
     )
 
 
@@ -625,7 +644,7 @@ def test_pinned_subject_without_effort_records_no_effort_line(scratch: Scratch) 
     scratch.env["SMEVALS_MODEL"] = "pinned"
     proc = scratch.run(["--subject", str(subject), "--stage", str(scratch.corpus)])
     assert proc.returncode == 0
-    assert scratch.condition() == RUNNER_LINE + "model: opus\nresolved: stub-model-id\n"
+    assert scratch.condition() == CONDITION_HEAD + "model: opus\nresolved: stub-model-id\n"
 
 
 def test_subject_alone_changes_nothing(scratch: Scratch) -> None:
@@ -635,7 +654,7 @@ def test_subject_alone_changes_nothing(scratch: Scratch) -> None:
     argv = scratch.argv()
     assert argv[argv.index("--model") + 1] == "stub-model"
     assert "--effort" not in argv
-    assert scratch.condition() == RUNNER_LINE + "model: stub-model\nresolved: stub-model-id\n"
+    assert scratch.condition() == CONDITION_HEAD + "model: stub-model\nresolved: stub-model-id\n"
 
 
 def test_pinned_without_subject_fails_naming_the_flag(scratch: Scratch) -> None:
@@ -773,7 +792,7 @@ def test_stream_mode_reports_the_last_result(scratch: Scratch) -> None:
     assert proc.returncode == 0, proc.stderr
     assert proc.stderr == ""
     assert proc.stdout == "STUB-RESULT\ntwo lines\n"
-    assert scratch.condition() == RUNNER_LINE + "model: stub-model\nresolved: stub-model-id\n"
+    assert scratch.condition() == CONDITION_HEAD + "model: stub-model\nresolved: stub-model-id\n"
 
 
 def test_stream_file_sits_beside_the_worked_tree_not_in_it(scratch: Scratch) -> None:
@@ -793,7 +812,7 @@ def test_stream_with_no_result_event_prints_nothing_and_says_so(scratch: Scratch
     assert proc.returncode == 0
     assert proc.stdout == ""
     assert "no result event" in proc.stderr
-    assert scratch.condition() == RUNNER_LINE + "model: stub-model\n"
+    assert scratch.condition() == CONDITION_HEAD + "model: stub-model\n"
     assert [body for _, body in scratch.stream()][1:-1] == [
         '{"type":"system","subtype":"init"}',
         "not json at all",
@@ -960,3 +979,45 @@ def test_missing_rules_directory_fails_before_claude(scratch: Scratch) -> None:
     assert "--rules directory not found" in proc.stderr
     assert "single-file.md" in proc.stderr
     assert not scratch.claude_invoked()
+
+
+def test_condition_tells_two_contexts_apart(scratch: Scratch) -> None:
+    # A suite whose context shrinks without any of its own files changing sees it here.
+    context = scratch.root / "single-file.md"
+    hashes = []
+    for body in ("house rules\n", "house rules\n", "fewer rules\n"):
+        context.write_text(body)
+        scratch.run_dir = scratch.root / f"run-{len(hashes)}"
+        scratch.run_dir.mkdir()
+        proc = scratch.run(["--context", str(context)])
+        assert proc.returncode == 0, proc.stderr
+        assembled = (scratch.run_dir / "subject-context.md").read_bytes()
+        line = f"context-sha256: {hashlib.sha256(assembled).hexdigest()}\n"
+        assert line in scratch.condition()
+        hashes.append(line)
+    assert hashes[0] == hashes[1] != hashes[2]
+
+
+def test_condition_without_context_has_no_context_hash(scratch: Scratch) -> None:
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 0, proc.stderr
+    assert "context-sha256" not in scratch.condition()
+
+
+def test_condition_is_complete_for_a_session_that_had_to_be_killed(scratch: Scratch) -> None:
+    # Everything but the resolved line is known before the session starts.
+    scratch.env["STUB_SLEEP"] = "30"
+    proc = scratch.run(["--timeout", "1", "--", "--disallowedTools", "Bash"])
+    assert proc.returncode != 0
+    assert scratch.condition() == (
+        CONDITION_HEAD + 'model: stub-model\nclaude-args: ["--disallowedTools", "Bash"]\n'
+    )
+
+
+def test_claude_that_cannot_report_its_version_fails_before_the_session(scratch: Scratch) -> None:
+    scratch.env["STUB_VERSION_EXIT"] = "3"
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 1
+    assert "claude --version" in proc.stderr
+    assert not scratch.claude_invoked()
+    assert not (scratch.run_dir / "worked").exists()
