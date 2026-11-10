@@ -100,6 +100,15 @@ as a plugin tree is, so its Read tool will open it. A copied file is not, becaus
 takes a directory and the file's would open whatever else sits there; the commands a session
 runs reach it all the same.
 
+A subject that runs in production inside a repository clone, and keeps its scratch beside the
+clone, writes to the directory above the one it starts in. Above the work dir root that is the
+runner's own, which the session cannot touch. ``--cwd <subdir>`` starts the session in a
+directory inside the work dir instead, named by its path from the work dir root, so a suite
+stages the clone as a subdirectory and the directory above it is the work dir root, the
+session's own. Nothing else about the session changes, and the whole work dir is copied back
+as before. ``subject-condition.md`` records ``cwd: <subdir>``. In every run ``PWD`` names the
+directory the session starts in and not the caller's, which is the hidden run dir.
+
 ``--safe-mode`` does not drop a machine's managed settings. A session still runs their hooks,
 is allowed what their permission rules allow whatever the suite's own ``--allowedTools`` says,
 and gets their ``env`` (measured on Claude Code 2.1.321). They sit outside the home dir, so the
@@ -242,6 +251,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="PATH",
         help="a file or directory under the home directory the session gets a read-only copy "
         "of, at the same path under its own home, with symlinks followed; repeatable",
+    )
+    parser.add_argument(
+        "--cwd",
+        metavar="SUBDIR",
+        help="a directory inside the work dir, by its path from the work dir root, for the "
+        "session to start in (default: the work dir root)",
     )
     parser.add_argument(
         "--stream",
@@ -424,6 +439,36 @@ def stage(paths: list[str], work_dir: Path) -> None:
             shutil.copy2(source, work_dir / source.name)
 
 
+def resolve_start_dir(work_dir: Path, cwd: str | None) -> Path:
+    """Find the directory the session starts in, once staging has filled the work dir.
+
+    With no ``--cwd`` it is the work dir root. A ``--cwd`` path names a directory by its way
+    down from that root, so one that is empty, absolute, or holds a ``..`` is refused, as is
+    one that is not a directory or that a staged symlink leads out of the work dir. The
+    directory is returned resolved: a link to a directory inside the work dir is followed,
+    and the session starts in the directory it leads to.
+    """
+    if cwd is None:
+        return work_dir
+    if cwd == "":
+        fail("--cwd path is empty; name a directory inside the work dir, or drop the flag")
+    if os.path.isabs(cwd):
+        fail(f"--cwd path is absolute: {cwd}; name a directory by its path from the work dir root")
+    if ".." in Path(cwd).parts:
+        fail(
+            f"--cwd path has a .. in it: {cwd}; name a directory by its path from the work dir root"
+        )
+    start_dir = (work_dir / cwd).resolve()
+    if start_dir != work_dir and work_dir not in start_dir.parents:
+        fail(f"--cwd path leaves the work dir: {cwd} is a staged link that leads to {start_dir}")
+    if not start_dir.is_dir():
+        fail(
+            f"--cwd path is not a directory in the staged work dir: {cwd}; "
+            "stage a tree that holds it"
+        )
+    return start_dir
+
+
 def home_copy_files(path: Path, rel: Path, ancestors: frozenset[Path]) -> list[tuple[str, Path]]:
     """List the files a ``--home-copy`` path holds as (home-relative path, file), links followed.
 
@@ -583,7 +628,7 @@ def build_command(
     return cmd
 
 
-def session_env(session_home: Path, session_tmp: Path) -> dict[str, str]:
+def session_env(session_home: Path, session_tmp: Path, start_dir: Path) -> dict[str, str]:
     """Build the environment the subject session runs in.
 
     The subject session must not see smevals task metadata: scalar task fields become
@@ -596,6 +641,12 @@ def session_env(session_home: Path, session_tmp: Path) -> dict[str, str]:
     lookups find nothing. ``XDG_*`` vars would send the same lookups back to the operator's
     home, so they are dropped. claude's default temp dir is shared with every other session on
     the machine, so it is pointed at the session's.
+
+    ``PWD`` names the directory the session starts in. The caller's names the run dir, which
+    is hidden, and a tool that trusts ``PWD`` before asking the system, as ``/bin/pwd`` does,
+    is refused there. It is the resolved directory, the one the process is in: Claude Code
+    takes a ``PWD`` that differs from that for a second working directory (read from the
+    Claude Code 2.1.322 bundle).
     """
     env = {
         key: value for key, value in os.environ.items() if not key.startswith(("SMEVALS_", "XDG_"))
@@ -603,6 +654,7 @@ def session_env(session_home: Path, session_tmp: Path) -> dict[str, str]:
     env["HOME"] = str(session_home)
     env["TMPDIR"] = str(session_tmp)
     env["CLAUDE_CODE_TMPDIR"] = str(session_tmp)
+    env["PWD"] = str(start_dir)
     return env
 
 
@@ -681,11 +733,11 @@ def wait_for_stream_session(
 
 
 def run_session(
-    cmd: list[str], work_dir: Path, env: dict[str, str], result_file: Path, timeout_secs: float
+    cmd: list[str], start_dir: Path, env: dict[str, str], result_file: Path, timeout_secs: float
 ) -> int:
-    """Run claude in the work dir under the watchdog, its one result record going to a file."""
+    """Run claude in its start dir under the watchdog, its one result record going to a file."""
     with result_file.open("wb") as out:
-        proc = subprocess.Popen(cmd, cwd=work_dir, stdin=subprocess.DEVNULL, stdout=out, env=env)
+        proc = subprocess.Popen(cmd, cwd=start_dir, stdin=subprocess.DEVNULL, stdout=out, env=env)
         return wait_under_watchdog(proc, timeout_secs)
 
 
@@ -732,13 +784,13 @@ def stamp_stream(stdout: BinaryIO, log: BinaryIO, exited: threading.Event, quiet
 
 def run_stream_session(
     cmd: list[str],
-    work_dir: Path,
+    start_dir: Path,
     env: dict[str, str],
     stream_file: Path,
     timeout_secs: float,
     idle_secs: float | None,
 ) -> int:
-    """Run claude in the work dir under the watchdog, recording its event stream as it arrives.
+    """Run claude in its start dir under the watchdog, recording its event stream as it arrives.
 
     The runner stamps a line of its own at launch and at exit, so a reader can count the quiet
     time before the session's first event and after its last. The exit line carries the run's
@@ -747,7 +799,7 @@ def run_stream_session(
     with stream_file.open("wb") as log:
         stamp(log, json.dumps({"type": "runner_launch"}).encode())
         proc = subprocess.Popen(
-            cmd, cwd=work_dir, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, env=env
+            cmd, cwd=start_dir, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, env=env
         )
         stdout = proc.stdout
         if stdout is None:
@@ -903,6 +955,8 @@ def main(argv: list[str] | None = None) -> int:
     condition += [f"home-copy: {rel} sha256:{digest}\n" for _, rel, digest in home_copies]
     if args.idle_timeout is not None:
         condition.append(f"idle-timeout: {args.idle_timeout:g}\n")
+    if args.cwd is not None:
+        condition.append(f"cwd: {args.cwd}\n")
     # Command substitution in the shell runners strips trailing newlines from the prompt.
     prompt = sys.stdin.read().rstrip("\n")
 
@@ -954,6 +1008,7 @@ def main(argv: list[str] | None = None) -> int:
             # The home and each directory between it and the copy.
             pinned.update(session_home / parent for parent in rel.parents)
         stage(args.stage, work_dir)
+        start_dir = resolve_start_dir(work_dir, args.cwd)
         # The run dir is hidden wherever it is: it holds the runner's records of this
         # session, and its neighbours are other runs.
         hidden = [
@@ -1001,16 +1056,16 @@ def main(argv: list[str] | None = None) -> int:
             prompt,
             stream=args.stream,
         )
-        env = session_env(session_home, session_tmp)
+        env = session_env(session_home, session_tmp, start_dir)
         # The stream is written straight into the run dir as it arrives: it is the runner's
         # record, out of the subject's reach, and it survives a session that has to be killed.
         stream_file = run_dir / STREAM_FILE
         if args.stream:
             rc = run_stream_session(
-                cmd, work_dir, env, stream_file, args.timeout, args.idle_timeout
+                cmd, start_dir, env, stream_file, args.timeout, args.idle_timeout
             )
         else:
-            rc = run_session(cmd, work_dir, env, result_file, args.timeout)
+            rc = run_session(cmd, start_dir, env, result_file, args.timeout)
         copy_back(work_dir, run_dir)
         if context_text is not None:
             (run_dir / "subject-context.md").write_text(context_text, encoding="utf-8")

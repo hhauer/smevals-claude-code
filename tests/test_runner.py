@@ -1469,3 +1469,176 @@ def test_home_copy_refusals_fail_before_claude(scratch: Scratch, make_path, mess
     assert message in proc.stderr
     assert not scratch.claude_invoked()
     assert not (scratch.run_dir / "worked").exists()
+
+
+def make_tree(scratch: Scratch) -> Path:
+    """A staged tree whose clone/ subdirectory is the repository a subject works in.
+
+    It also holds a link to clone/ from inside the tree, a link to a directory outside it,
+    and a file.
+    """
+    tree = scratch.root / "tree"
+    (tree / "clone").mkdir(parents=True)
+    (tree / "clone" / "README.md").write_text("clone body\n")
+    (tree / "alias").symlink_to("clone")
+    elsewhere = scratch.root / "elsewhere"
+    elsewhere.mkdir()
+    (tree / "out").symlink_to(elsewhere)
+    return tree
+
+
+def test_cwd_starts_the_session_in_a_subdirectory_of_the_work_dir(scratch: Scratch) -> None:
+    # A subject that keeps its scratch beside its repository writes to the directory above the
+    # one it starts in. Started at the work dir root, that is a directory it cannot write.
+    scratch.env["STUB_PLANT"] = "../beside.md"
+    proc = scratch.run(["--stage", str(make_tree(scratch)), "--cwd", "clone"])
+    assert proc.stderr == ""
+    assert proc.returncode == 0
+    session_root = Path(scratch.recorded("dirs").splitlines()[0]).parent
+    assert scratch.recorded("pwd") == str(session_root / "work" / "clone")
+    assert scratch.recorded("plant") == "planted"
+    assert scratch.argv() == [*BASE_ARGV, "PROMPT-TEXT"]
+    # The whole work dir comes back, so the clone and what was written beside it both do.
+    worked = scratch.run_dir / "worked"
+    assert (worked / "clone" / "README.md").read_text() == "clone body\n"
+    assert (worked / "clone" / "stub-marker.md").is_file()
+    assert not (worked / "stub-marker.md").exists()
+    assert (worked / "beside.md").read_text() == "planted\n"
+    assert scratch.condition() == (
+        CONDITION_HEAD + "model: stub-model\ncwd: clone\nresolved: stub-model-id\n"
+    )
+
+
+def test_cwd_leaves_the_directory_above_the_work_dir_closed(scratch: Scratch) -> None:
+    scratch.env["STUB_PLANT"] = "../../above.md"
+    proc = scratch.run(["--stage", str(make_tree(scratch)), "--cwd", "clone"])
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.recorded("plant") == "refused"
+
+
+def test_cwd_composes_with_the_flags_that_change_the_session(scratch: Scratch) -> None:
+    hooks, _ = make_hooks(scratch)
+    plugin = make_plugin(scratch)
+    mcp_config = scratch.root / "mcp.json"
+    mcp_config.write_text("{}\n")
+    context = scratch.root / "CLAUDE.md"
+    context.write_text("CONTEXT-BODY\n")
+    proc = scratch.run(
+        [
+            "--stage",
+            str(make_tree(scratch)),
+            "--cwd",
+            "clone",
+            "--stream",
+            "--mcp-config",
+            str(mcp_config),
+            "--context",
+            str(context),
+            "--plugin-root",
+            str(plugin),
+            "--home-copy",
+            str(hooks),
+        ]
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "STUB-RESULT\ntwo lines\n"
+    session_home = Path(scratch.recorded("dirs").splitlines()[0])
+    session_root = session_home.parent
+    assert scratch.recorded("pwd") == str(session_root / "work" / "clone")
+    # The command line is the one these flags give a session that starts at the root.
+    assert scratch.argv() == [
+        "-p",
+        "--setting-sources",
+        "",
+        "--strict-mcp-config",
+        "--mcp-config",
+        str(mcp_config),
+        "--model",
+        "stub-model",
+        "--permission-mode",
+        "acceptEdits",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--append-system-prompt-file",
+        str(session_root / "context.md"),
+        "--add-dir",
+        str(session_root / "plugin"),
+        "--add-dir",
+        str(session_home / ".hooks"),
+        "--",
+        "PROMPT-TEXT",
+    ]
+    assert scratch.recorded("ctx").endswith("CONTEXT-BODY")
+    assert [body for _, body in scratch.stream()][1:-1] == STREAM_LINES
+    assert (scratch.run_dir / "worked" / "clone" / "stub-marker.md").is_file()
+    assert [line.split(":")[0] for line in scratch.condition().splitlines()] == [
+        "runner",
+        "claude",
+        "model",
+        "context-sha256",
+        "plugin-root",
+        "home-copy",
+        "cwd",
+        "resolved",
+    ]
+    assert "cwd: clone\n" in scratch.condition()
+
+
+@pytest.mark.parametrize(
+    ("cwd", "message"),
+    [
+        pytest.param(lambda _: "", "is empty", id="empty"),
+        pytest.param(lambda s: str(s.root / "tree" / "clone"), "is absolute", id="absolute"),
+        pytest.param(lambda _: "..", "has a .. in it", id="the directory above"),
+        pytest.param(lambda _: "clone/../..", "has a .. in it", id="climbs out"),
+        pytest.param(lambda _: "clone/../clone", "has a .. in it", id="climbs and returns"),
+        pytest.param(lambda _: "out", "leaves the work dir", id="link out of the work dir"),
+        pytest.param(lambda _: "clone/README.md", "is not a directory", id="a file"),
+        pytest.param(lambda _: "no-such-dir", "is not a directory", id="missing"),
+    ],
+)
+def test_cwd_refusals_fail_before_claude(scratch: Scratch, cwd, message: str) -> None:
+    proc = scratch.run(["--stage", str(make_tree(scratch)), "--cwd", cwd(scratch)])
+    assert proc.returncode == 1
+    assert proc.stderr.startswith("smevals-claude-code: --cwd ")
+    assert message in proc.stderr
+    assert not scratch.claude_invoked()
+    assert not (scratch.run_dir / "worked").exists()
+
+
+# Bash corrects a PWD that does not name its directory as it starts, so the stub cannot see
+# the value the runner passed. This stands in front of the stub and records it first.
+PWD_RECORDER = """#!/usr/bin/perl
+open(my $log, ">", "$ENV{STUB_LOG}.envpwd") or die "open: $!";
+print $log "$ENV{PWD}\\n";
+close($log);
+exec("$0-stub", @ARGV) or die "exec: $!";
+"""
+
+
+@pytest.mark.parametrize(
+    ("args", "directory"),
+    [
+        pytest.param([], "work", id="the work dir root"),
+        pytest.param(["--cwd", "clone"], "clone", id="a subdirectory"),
+        # The directory the link leads to, by its own name: a PWD that differs from the
+        # directory the process is in is one Claude Code treats as a second working directory
+        # (read from the Claude Code 2.1.322 bundle).
+        pytest.param(["--cwd", "alias"], "clone", id="a link to a subdirectory"),
+    ],
+)
+def test_pwd_names_the_directory_the_session_starts_in(
+    scratch: Scratch, args: list[str], directory: str
+) -> None:
+    # The caller's PWD names the run dir, which is hidden: a tool that trusts PWD, as /bin/pwd
+    # does, is refused there.
+    stub = scratch.root / "bin" / "claude"
+    stub.rename(stub.with_name("claude-stub"))
+    stub.write_text(PWD_RECORDER)
+    stub.chmod(0o755)
+    scratch.env["PWD"] = str(scratch.run_dir)
+    proc = scratch.run(["--stage", str(make_tree(scratch)), *args])
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.recorded("envpwd") == scratch.recorded("pwd")
+    assert Path(scratch.recorded("envpwd")).name == directory
