@@ -20,7 +20,11 @@ RUNNER_LINE = f"runner: smevals-claude-code {version('smevals-claude-code')}\n"
 # would (one edit, one new file), then exits with STUB_EXIT. It prints the JSON result record
 # claude -p --output-format json prints (or STUB_RAW verbatim, for a session whose output is not
 # a result record). STUB_SLEEP simulates a hung session for the watchdog test; the TERM trap and
-# backgrounded sleep model the real claude CLI dying promptly on SIGTERM.
+# backgrounded sleep model the real claude CLI dying promptly on SIGTERM. Three hooks act the way
+# a curious or hostile subject would and record how the sandbox answered: STUB_PROBE names a path
+# to read (as a directory listing or a file), STUB_STEAL a path to hard-link or move into the work
+# dir, and STUB_PLANT a path to create. The stub also records the home and temp dirs it was
+# handed, where the home's keychain link points, and whether a temp file round-trips.
 STUB = """#!/usr/bin/env bash
 set -euo pipefail
 trap 'exit 143' TERM
@@ -38,11 +42,44 @@ if [[ -f staged/fixture.md ]]; then
   echo "stub edit" >> staged/fixture.md
 fi
 echo "stub artifact" > stub-marker.md
+if [[ -n ${STUB_PROBE:-} ]]; then
+  if ls "$STUB_PROBE"/ >/dev/null 2>&1 || cat "$STUB_PROBE" >/dev/null 2>&1; then
+    echo readable > "$STUB_LOG.probe"
+  else
+    echo denied > "$STUB_LOG.probe"
+  fi
+fi
+if [[ -n ${STUB_STEAL:-} ]]; then
+  if ln "$STUB_STEAL" ./linked 2>/dev/null; then
+    echo linked > "$STUB_LOG.steal"
+  elif mv "$STUB_STEAL" ./stolen 2>/dev/null; then
+    echo moved > "$STUB_LOG.steal"
+  else
+    echo refused > "$STUB_LOG.steal"
+  fi
+fi
+if [[ -n ${STUB_PLANT:-} ]]; then
+  if { echo planted > "$STUB_PLANT"; } 2>/dev/null; then
+    echo planted > "$STUB_LOG.plant"
+  else
+    echo refused > "$STUB_LOG.plant"
+  fi
+fi
+printf '%s\\n' "${HOME:-}" "${TMPDIR:-}" "${CLAUDE_CODE_TMPDIR:-}" > "$STUB_LOG.dirs"
+readlink "$HOME/Library/Keychains" > "$STUB_LOG.keychains" 2>/dev/null || true
+env | grep '^XDG_' > "$STUB_LOG.xdg" || true
+if tmp_file=$(mktemp "${TMPDIR:-/nonexistent}/stub.XXXXXX" 2>/dev/null) \\
+  && echo round-trip > "$tmp_file" && cat "$tmp_file" > "$STUB_LOG.tmp" 2>/dev/null; then
+  :
+else
+  echo failed > "$STUB_LOG.tmp"
+fi
 if [[ -n ${STUB_HOSTILE:-} ]]; then
-  # A subject that plants a module and squats the reserved names.
+  # A subject that plants a module and squats names the runner and smevals write later.
   printf 'raise SystemExit("hijacked json module")\\n' > json.py
   ln -s "$STUB_HOSTILE" subject-condition.md
   ln -s "$STUB_HOSTILE" subject-context.md
+  ln -s "$STUB_HOSTILE" output.txt
 fi
 if [[ -n ${STUB_RAW:-} ]]; then
   printf '%s\\n' "$STUB_RAW"
@@ -55,7 +92,11 @@ exit "${STUB_EXIT:-0}"
 
 
 class Scratch:
-    """A fake smevals run dir, a corpus, and the claude stub on PATH."""
+    """A fake smevals run dir, a corpus, an operator home, and the claude stub on PATH.
+
+    HOME and TMPDIR both point inside the test's own directory, so the runner hides a home and
+    keeps its work dirs where the test can plant files without touching the real ones.
+    """
 
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -70,10 +111,21 @@ class Scratch:
         (self.corpus / "staged").mkdir(parents=True)
         (self.corpus / "staged" / "fixture.md").write_text("fixture body\n")
         (root / "single-file.md").write_text("single file body\n")
+        self.home = root / "home"
+        self.home.mkdir()
+        (self.home / "secret.md").write_text("operator file\n")
+        temp_root = root / "tmp"
+        temp_root.mkdir()
+        # Where the runner keeps every run's dirs; a sibling run's fixture sits beside ours.
+        self.sibling_fixture = temp_root / "smevals-claude-code" / "sibling" / "work" / "fixture.md"
+        self.sibling_fixture.parent.mkdir(parents=True)
+        self.sibling_fixture.write_text("sibling fixture\n")
         self.env = os.environ.copy()
         self.env.update(
             {
                 "PATH": f"{bin_dir}:{self.env['PATH']}",
+                "HOME": str(self.home),
+                "TMPDIR": str(temp_root),
                 "STUB_LOG": str(root / "stub-log"),
                 "SMEVALS_MODEL": "stub-model",
             }
@@ -97,6 +149,13 @@ class Scratch:
 
     def claude_invoked(self) -> bool:
         return (self.root / "stub-log.pwd").is_file()
+
+    def recorded(self, name: str) -> str:
+        log = self.root / f"stub-log.{name}"
+        return log.read_text().strip() if log.is_file() else f"no {name} recorded"
+
+    def probe(self) -> str:
+        return self.recorded("probe")
 
     def condition(self) -> str:
         path = self.run_dir / "subject-condition.md"
@@ -138,16 +197,198 @@ def test_isolated_session(scratch: Scratch) -> None:
     assert argv[-2:] == ["--", "PROMPT-TEXT"]
     assert not stub_pwd.exists(), "work dir cleaned up after the run"
     assert (scratch.root / "stub-log.env").read_text() == "", "no SMEVALS_* vars reach the subject"
-    fixture = scratch.run_dir / "staged" / "fixture.md"
+    fixture = scratch.run_dir / "worked" / "staged" / "fixture.md"
     assert fixture.is_file()
     assert "stub edit" in fixture.read_text()
-    assert (scratch.run_dir / "stub-marker.md").is_file()
+    assert (scratch.run_dir / "worked" / "stub-marker.md").is_file()
+
+
+def host_paths_the_subject_must_not_read() -> list:
+    in_users = pytest.mark.skipif(
+        Path("/Users") not in REPO_ROOT.parents, reason="this checkout is not under /Users"
+    )
+    return [
+        pytest.param(lambda s: s.home / "secret.md", id="file in the operator's home"),
+        pytest.param(lambda s: s.home, id="the operator's home"),
+        pytest.param(lambda s: s.sibling_fixture, id="sibling run's fixture"),
+        pytest.param(lambda s: s.sibling_fixture.parent.parent.parent, id="the runner's base dir"),
+        pytest.param(
+            lambda _: REPO_ROOT / "pyproject.toml", id="file under /Users", marks=in_users
+        ),
+        pytest.param(lambda _: REPO_ROOT, id="directory under /Users", marks=in_users),
+        # Exists on any machine that has run Claude Code; elsewhere a missing dir also reads
+        # as denied, so this case proves the rule only where the dir is there to hide.
+        pytest.param(
+            lambda _: Path(f"/private/tmp/claude-{os.getuid()}"), id="claude's shared temp dir"
+        ),
+    ]
+
+
+@pytest.mark.parametrize("host_path", host_paths_the_subject_must_not_read())
+def test_subject_cannot_read_the_hidden_host_paths(scratch: Scratch, host_path) -> None:
+    scratch.env["STUB_PROBE"] = str(host_path(scratch))
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.probe() == "denied"
+
+
+@pytest.mark.parametrize("staged_path", ["staged/fixture.md", "staged", "."])
+def test_subject_reads_its_own_work_dir(scratch: Scratch, staged_path: str) -> None:
+    scratch.env["STUB_PROBE"] = staged_path
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.probe() == "readable"
+
+
+def test_temp_outside_the_runner_base_stays_readable(scratch: Scratch) -> None:
+    # The stated limit of the sandbox: tools need the shared temp dirs, so only the runner's
+    # own base dir and claude's shared temp dir are hidden there.
+    elsewhere = scratch.root / "tmp" / "another-programs-file.txt"
+    elsewhere.write_text("not hidden\n")
+    scratch.env["STUB_PROBE"] = str(elsewhere)
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.probe() == "readable"
+
+
+@pytest.mark.parametrize(
+    "hidden_file",
+    [
+        pytest.param(lambda s: s.home / "secret.md", id="file in the operator's home"),
+        pytest.param(lambda s: s.sibling_fixture, id="sibling run's fixture"),
+    ],
+)
+def test_subject_cannot_move_a_hidden_file_into_its_work_dir(scratch: Scratch, hidden_file) -> None:
+    # Moving or hard-linking a file reads nothing, so hiding a path from reads alone would let
+    # it be carried into the work dir and read there.
+    target = hidden_file(scratch)
+    body = target.read_text()
+    scratch.env["STUB_STEAL"] = str(target)
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.recorded("steal") == "refused"
+    assert target.read_text() == body
+    assert not (scratch.run_dir / "worked" / "stolen").exists()
+    assert not (scratch.run_dir / "worked" / "linked").exists()
+
+
+def test_subject_cannot_write_into_the_operators_home(scratch: Scratch) -> None:
+    planted = scratch.home / "planted.md"
+    scratch.env["STUB_PLANT"] = str(planted)
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.recorded("plant") == "refused"
+    assert not planted.exists()
+
+
+def test_allow_read_opens_a_directory_and_a_file_and_is_recorded(scratch: Scratch) -> None:
+    tools = scratch.home / "tools"
+    (tools / "bin").mkdir(parents=True)
+    (tools / "bin" / "tool").write_text("tool body\n")
+    lone = scratch.home / "secret.md"
+    for probe in (tools / "bin", tools / "bin" / "tool", lone):
+        scratch.env["STUB_PROBE"] = str(probe)
+        (scratch.root / "stub-log.probe").unlink(missing_ok=True)
+        run_dir = scratch.root / f"run-{probe.name}"
+        run_dir.mkdir()
+        scratch.run_dir = run_dir
+        proc = scratch.run(["--allow-read", str(tools), "--allow-read", str(lone)])
+        assert proc.returncode == 0, proc.stderr
+        assert scratch.probe() == "readable", probe
+    assert scratch.condition() == (
+        RUNNER_LINE
+        + "model: stub-model\n"
+        + f"allow-read: {tools.resolve()}\n"
+        + f"allow-read: {lone.resolve()}\n"
+        + "resolved: stub-model-id\n"
+    )
+
+
+def test_allow_read_does_not_open_its_siblings(scratch: Scratch) -> None:
+    tools = scratch.home / "tools"
+    tools.mkdir()
+    scratch.env["STUB_PROBE"] = str(scratch.home / "secret.md")
+    proc = scratch.run(["--stage", str(scratch.corpus), "--allow-read", str(tools)])
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.probe() == "denied"
+
+
+def test_allow_read_does_not_allow_writing(scratch: Scratch) -> None:
+    tools = scratch.home / "tools"
+    tools.mkdir()
+    scratch.env["STUB_PLANT"] = str(tools / "planted.md")
+    proc = scratch.run(["--stage", str(scratch.corpus), "--allow-read", str(tools)])
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.recorded("plant") == "refused"
+    assert not (tools / "planted.md").exists()
+
+
+def test_missing_allow_read_path_fails_before_claude(scratch: Scratch) -> None:
+    proc = scratch.run(["--allow-read", str(scratch.root / "no-such-tools")])
+    assert proc.returncode == 1
+    assert "--allow-read path not found" in proc.stderr
+    assert "no-such-tools" in proc.stderr
+    assert not scratch.claude_invoked()
+
+
+def test_session_gets_a_home_and_temp_dir_of_its_own(scratch: Scratch) -> None:
+    # XDG dirs name places in the operator's home; a tool sent there would be refused.
+    scratch.env["XDG_CONFIG_HOME"] = str(scratch.home / ".config")
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 0, proc.stderr
+    home, tmpdir, claude_tmpdir = scratch.recorded("dirs").splitlines()
+    stub_pwd = scratch.recorded("pwd")
+    assert len({home, tmpdir, stub_pwd, str(scratch.home)}) == 4, "home, temp, and work dir differ"
+    assert tmpdir == claude_tmpdir
+    assert scratch.recorded("tmp") == "round-trip"
+    assert scratch.recorded("xdg") == ""
+    # The login keychain is found through the home dir, so the session's home links to it.
+    assert scratch.recorded("keychains") == str(scratch.home.resolve() / "Library" / "Keychains")
+    assert not Path(home).exists(), "session home cleaned up after the run"
+    assert not Path(tmpdir).exists(), "session temp dir cleaned up after the run"
+
+
+def test_refuses_a_base_dir_someone_else_put_there(scratch: Scratch) -> None:
+    # The base dir has a fixed name under the temp root. One that is a link leads the run's
+    # dirs somewhere the sandbox profile does not describe.
+    temp_root = scratch.root / "other-tmp"
+    temp_root.mkdir()
+    elsewhere = scratch.root / "elsewhere"
+    elsewhere.mkdir()
+    (temp_root / "smevals-claude-code").symlink_to(elsewhere)
+    scratch.env["TMPDIR"] = str(temp_root)
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 1
+    assert "refusing to use" in proc.stderr
+    assert "smevals-claude-code" in proc.stderr
+    assert not scratch.claude_invoked()
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_missing_sandbox_exec_fails_before_claude(scratch: Scratch) -> None:
+    scratch.env["PATH"] = str(scratch.root / "bin")
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 1
+    assert "sandbox-exec not found on PATH" in proc.stderr
+    assert not scratch.claude_invoked()
+    assert not (scratch.run_dir / "worked").exists()
+
+
+def test_missing_claude_fails_naming_it(scratch: Scratch) -> None:
+    only_sandbox = scratch.root / "only-sandbox"
+    only_sandbox.mkdir()
+    (only_sandbox / "sandbox-exec").symlink_to("/usr/bin/sandbox-exec")
+    scratch.env["PATH"] = str(only_sandbox)
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 1
+    assert "claude not found on PATH" in proc.stderr
+    assert not (scratch.run_dir / "worked").exists()
 
 
 def test_single_file_staging(scratch: Scratch) -> None:
     proc = scratch.run(["--stage", str(scratch.root / "single-file.md")])
     assert proc.returncode == 0
-    staged = scratch.run_dir / "single-file.md"
+    staged = scratch.run_dir / "worked" / "single-file.md"
     assert staged.is_file()
     assert "single file body" in staged.read_text()
 
@@ -156,7 +397,7 @@ def test_failing_session_propagates_exit_and_still_copies_back(scratch: Scratch)
     scratch.env["STUB_EXIT"] = "7"
     proc = scratch.run(["--stage", str(scratch.corpus)])
     assert proc.returncode == 7
-    fixture = scratch.run_dir / "staged" / "fixture.md"
+    fixture = scratch.run_dir / "worked" / "staged" / "fixture.md"
     assert fixture.is_file()
     assert "stub edit" in fixture.read_text()
 
@@ -169,7 +410,7 @@ def test_watchdog_kills_a_hung_session(scratch: Scratch) -> None:
     assert proc.returncode != 0
     assert elapsed < 20
     assert proc.stderr == ""
-    assert (scratch.run_dir / "staged" / "fixture.md").is_file()
+    assert (scratch.run_dir / "worked" / "staged" / "fixture.md").is_file()
     assert scratch.condition() == RUNNER_LINE + "model: stub-model\n"
     assert proc.stdout == ""
 
@@ -192,6 +433,22 @@ def test_hostile_worked_tree(scratch: Scratch) -> None:
     assert not context.is_symlink()
     assert context.is_file()
     assert "single file body" in context.read_text()
+    # smevals writes output.txt, stderr.txt, and run.yaml into the run dir after the runner
+    # exits; nothing the subject left may sit under a name at that level.
+    assert sorted(entry.name for entry in scratch.run_dir.iterdir()) == [
+        "subject-condition.md",
+        "subject-context.md",
+        "worked",
+    ]
+    assert (scratch.run_dir / "worked" / "output.txt").is_symlink()
+
+
+def test_refuses_a_run_dir_that_already_holds_a_worked_tree(scratch: Scratch) -> None:
+    (scratch.run_dir / "worked").mkdir()
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 1
+    assert "worked" in proc.stderr
+    assert not scratch.claude_invoked()
 
 
 def test_output_that_is_not_a_result_record_passes_through(scratch: Scratch) -> None:
@@ -377,8 +634,9 @@ def test_pinned_plus_config_effort_is_refused(scratch: Scratch) -> None:
 
 
 def test_mcp_session_swaps_safe_mode_for_strict_setting_sources(scratch: Scratch) -> None:
-    mcp_file = scratch.root / "mcp.json"
+    mcp_file = scratch.home / "mcp.json"
     mcp_file.write_text('{"mcpServers":{}}\n')
+    scratch.env["STUB_PROBE"] = str(mcp_file)
     proc = scratch.run(["--stage", str(scratch.corpus), "--mcp-config", str(mcp_file)])
     assert proc.returncode == 0
     assert proc.stderr == ""
@@ -387,6 +645,7 @@ def test_mcp_session_swaps_safe_mode_for_strict_setting_sources(scratch: Scratch
     assert argv[argv.index("--setting-sources") + 1] == ""
     assert "--strict-mcp-config" in argv
     assert argv[argv.index("--mcp-config") + 1] == str(mcp_file)
+    assert scratch.probe() == "readable", "the session can read the MCP config it was handed"
     assert argv[argv.index("--model") + 1] == "stub-model"
 
 
@@ -416,4 +675,4 @@ def test_refuses_a_git_work_tree_root_as_the_run_dir(scratch: Scratch, make_git)
     assert proc.returncode == 1
     assert "refusing to run in a git work-tree root" in proc.stderr
     assert not scratch.claude_invoked()
-    assert not (scratch.run_dir / "staged" / "fixture.md").exists()
+    assert not (scratch.run_dir / "worked" / "staged" / "fixture.md").exists()
