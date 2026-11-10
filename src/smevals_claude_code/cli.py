@@ -23,8 +23,11 @@ The subject session must not read the operator's files either: a suite's skills,
 checkers sit on the same disk, and a session that finds them is no longer measuring what the eval
 means to. The session runs under the macOS sandbox (``sandbox-exec``), unable to read or write
 under ``/Users``, the operator's home, the run dir, the base dir that holds every run's work
-dir, or claude's shared temp dir. It is given an empty home and a temp dir of its own, so the
-lookups tools make there find nothing instead of being refused. The rest of the system stays
+dir, or claude's shared temp dir. It is given a home and a temp dir of its own, so the lookups
+tools make there find nothing instead of being refused. The home holds one file besides the
+keychain link, a git config with a fixed identity, so a subject that commits does so under the
+same name in every run and on every machine and not one git makes up from the operator's login.
+The rest of the system stays
 readable, so installed tools work; a tool or file that lives under the home dir is opened by
 ``--allow-read``, read-only, and recorded in ``subject-condition.md``. Residual: the shared temp
 dirs (``/tmp`` and the per-user temp root) stay readable outside the runner's base dir, because
@@ -119,6 +122,9 @@ DEFAULT_TIMEOUT_SECS = 540.0
 # What a skill writes for its plugin's install directory. The harness replaces it in a skill
 # it loads; a subject inlined into the prompt has it replaced by the runner.
 PLUGIN_ROOT_VARIABLE = "${CLAUDE_PLUGIN_ROOT}"
+# The git config in the session's home. The home has none of the operator's, and git left to
+# itself makes an identity up from the login name and host name or refuses to commit.
+SESSION_GITCONFIG = "[user]\n\tname = Eval Subject\n\temail = subject@example.invalid\n"
 # The run dir file a stream-mode session's events are recorded in, each with its arrival time.
 STREAM_FILE = "subject-stream.jsonl"
 # How often the stream reader checks whether claude has exited, and how much it reads at once.
@@ -799,6 +805,7 @@ def main(argv: list[str] | None = None) -> int:
         # with the directory read-only or only the keychain file writable the save is refused
         # (measured with the security CLI on Darwin 25.6.0).
         (session_home / "Library" / "Keychains").symlink_to(keychains)
+        (session_home / ".gitconfig").write_text(SESSION_GITCONFIG, encoding="utf-8")
         stage(args.stage, work_dir)
         # The run dir is hidden wherever it is: it holds the runner's records of this
         # session, and its neighbours are other runs.

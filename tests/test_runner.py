@@ -45,7 +45,8 @@ STREAM_LINES = [
 # session waiting on a background job is, and it then prints STUB_STREAM_LATE. Asked for its
 # version it answers and does nothing else, or fails with STUB_VERSION_EXIT. STUB_PROMPT_PATH
 # treats the prompt as a path: the stub records the file's body, or that it was denied, and
-# whether it could write there.
+# whether it could write there. STUB_GIT_COMMIT makes a repository in the work dir and commits
+# to it, recording the author git used or that the commit failed.
 STUB = """#!/usr/bin/env bash
 set -euo pipefail
 trap 'exit 143' TERM
@@ -88,6 +89,13 @@ if [[ -n ${STUB_PLANT:-} ]]; then
     echo planted > "$STUB_LOG.plant"
   else
     echo refused > "$STUB_LOG.plant"
+  fi
+fi
+if [[ -n ${STUB_GIT_COMMIT:-} ]]; then
+  if git init -q repo 2>/dev/null && git -C repo commit -q --allow-empty -m probe 2>/dev/null; then
+    git -C repo log -1 --format='%an <%ae>' > "$STUB_LOG.commit"
+  else
+    echo failed > "$STUB_LOG.commit"
   fi
 fi
 if [[ -n ${STUB_PROMPT_PATH:-} ]]; then
@@ -1154,3 +1162,16 @@ def test_missing_plugin_root_fails_before_claude(scratch: Scratch) -> None:
     assert "--plugin-root directory not found" in proc.stderr
     assert "single-file.md" in proc.stderr
     assert not scratch.claude_invoked()
+
+
+def test_subject_can_commit_in_its_empty_home(scratch: Scratch) -> None:
+    # The session's home has none of the operator's git config. Left to itself git makes an
+    # identity up from the login name and the host name, or refuses the commit where it cannot
+    # (measured on git 2.56.0 on Darwin 25.6.0: it made one up). The runner gives the session an
+    # identity of its own, the same in every run and on every machine.
+    for name in [key for key in scratch.env if key.startswith("GIT_")]:
+        del scratch.env[name]
+    scratch.env["STUB_GIT_COMMIT"] = "1"
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.recorded("commit") == "Eval Subject <subject@example.invalid>"
