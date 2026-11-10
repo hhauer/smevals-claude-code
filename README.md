@@ -7,7 +7,7 @@ The session runs under the macOS sandbox, so the runner needs macOS. The subject
 ## Install
 
 ```bash
-uv tool install "smevals-claude-code @ git+https://github.com/hhauer/smevals-claude-code@v0.4.0"
+uv tool install "smevals-claude-code @ git+https://github.com/hhauer/smevals-claude-code@v0.5.0"
 ```
 
 Pin a tag. A new version can change the `claude` command line or what the session can reach, which is the condition every eval anchor was measured under.
@@ -48,6 +48,8 @@ A subject whose skill text refers to its plugin's bundled files through `${CLAUD
 ```bash
 printf '%s' "$prompt" | smevals-claude-code --stage "$CORPUS" --plugin-root "$PLUGIN_DIR"
 ```
+
+`--safe-mode` does not drop a machine's managed settings (`/Library/Application Support/ClaudeCode/managed-settings.json`): the subject still runs their hooks and is allowed whatever their permission rules allow, on top of the suite's own `--allowedTools`. A suite that wants its subject measured without them passes `--hide-managed-settings`. Claude Code then prints a "Managed settings failed to load" notice on stderr and runs without them.
 
 Graders read the subject's files from `worked/` in the run dir, for example `$SMEVALS_RUN_DIR/worked/report.md`.
 

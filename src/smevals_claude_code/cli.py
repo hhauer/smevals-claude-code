@@ -85,6 +85,14 @@ claude with ``--add-dir`` so its Read tool will open it. The path differs per
 run, as the work dir's does. The variable is not put in the session's environment: the harness
 does not give it to the commands a session runs either.
 
+``--safe-mode`` does not drop a machine's managed settings. A session still runs their hooks,
+is allowed what their permission rules allow whatever the suite's own ``--allowedTools`` says,
+and gets their ``env`` (measured on Claude Code 2.1.321). They sit outside the home dir, so the
+sandbox leaves them readable. ``--hide-managed-settings`` hides their directory: the session
+then runs without them, and claude says on stderr that they failed to load. It is a flag because
+a subject's production sessions run under those settings, and a suite may mean to measure that.
+``subject-condition.md`` records ``managed-settings: hidden``.
+
 ``--mcp-config <file>`` is the one opt-in that changes the isolation mechanism. ``--safe-mode``
 drops every MCP server, including the ones ``--mcp-config`` names and a cwd ``.mcp.json``, and
 ``--bare`` never reads OAuth. An MCP session therefore runs with ``--setting-sources ""`` instead,
@@ -120,6 +128,8 @@ PROJECT_LABEL = "project instructions, checked into the codebase"
 # smevals write their own files beside it, never inside it.
 WORKED_DIR = "worked"
 DEFAULT_TIMEOUT_SECS = 540.0
+# Where Claude Code reads a machine's managed settings on macOS.
+MANAGED_SETTINGS_DIR = Path("/Library/Application Support/ClaudeCode")
 # What a skill writes for its plugin's install directory. The harness replaces it in a skill
 # it loads; a subject inlined into the prompt has it replaced by the runner.
 PLUGIN_ROOT_VARIABLE = "${CLAUDE_PLUGIN_ROOT}"
@@ -193,6 +203,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="PATH",
         help="a host directory or file the sandboxed session may read, such as a tool "
         "installed under the home directory; repeatable",
+    )
+    parser.add_argument(
+        "--hide-managed-settings",
+        action="store_true",
+        help="hide the machine's managed settings from the session, which --safe-mode still "
+        "applies: their hooks, permission rules, and env",
     )
     parser.add_argument(
         "--plugin-root",
@@ -779,6 +795,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.claude_args:
         condition.append(f"claude-args: {json.dumps(args.claude_args)}\n")
     condition += [f"allow-read: {allowed}\n" for allowed in allow_read]
+    if args.hide_managed_settings:
+        condition.append("managed-settings: hidden\n")
     if args.plugin_root is not None:
         condition.append(f"plugin-root: {Path(args.plugin_root).resolve()}\n")
     if args.idle_timeout is not None:
@@ -823,6 +841,8 @@ def main(argv: list[str] | None = None) -> int:
             Path(f"/private/tmp/claude-{os.getuid()}"),
             run_dir.resolve(),
         ]
+        if args.hide_managed_settings:
+            hidden.append(MANAGED_SETTINGS_DIR)
         own = [work_dir, session_home, session_tmp, keychains]
         # The claude executable, by the path it is run by and the file that resolves to.
         readable = [Path(os.path.abspath(claude)), Path(claude).resolve(), *allow_read]

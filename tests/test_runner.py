@@ -1180,3 +1180,44 @@ def test_subject_can_commit_in_its_empty_home(scratch: Scratch) -> None:
     proc = scratch.run(["--stage", str(scratch.corpus)])
     assert proc.returncode == 0, proc.stderr
     assert scratch.recorded("commit") == "Eval Subject <subject@example.invalid>"
+
+
+# Where Claude Code reads a machine's managed settings on macOS.
+MANAGED_SETTINGS = Path("/Library/Application Support/ClaudeCode")
+has_managed_settings = pytest.mark.skipif(
+    not MANAGED_SETTINGS.is_dir(), reason="this machine has no managed settings to hide"
+)
+
+
+def test_hide_managed_settings_hides_them_and_is_recorded(scratch: Scratch) -> None:
+    # Measured on Claude Code 2.1.321: a --safe-mode session still applies the machine's managed
+    # settings, hooks and permission rules both, and one that cannot read them runs without.
+    # On a machine with no managed settings the probe reads as denied either way, so this proves
+    # the rule only where the directory is there to hide.
+    scratch.env["STUB_PROBE"] = str(MANAGED_SETTINGS)
+    proc = scratch.run(["--stage", str(scratch.corpus), "--hide-managed-settings"])
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.probe() == "denied"
+    assert scratch.condition() == (
+        CONDITION_HEAD + "model: stub-model\nmanaged-settings: hidden\nresolved: stub-model-id\n"
+    )
+    assert scratch.argv()[:9] == [
+        "-p",
+        "--safe-mode",
+        "--model",
+        "stub-model",
+        "--permission-mode",
+        "acceptEdits",
+        "--output-format",
+        "json",
+        "--",
+    ]
+
+
+@has_managed_settings
+def test_managed_settings_stay_readable_without_the_flag(scratch: Scratch) -> None:
+    scratch.env["STUB_PROBE"] = str(MANAGED_SETTINGS)
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.probe() == "readable"
+    assert "managed-settings" not in scratch.condition()
