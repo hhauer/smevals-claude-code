@@ -107,6 +107,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="an MCP config file; switches the session to --setting-sources '' --strict-mcp-config",
     )
     parser.add_argument(
+        "--allow-read",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="a host directory or file the sandboxed session may read, such as a tool "
+        "installed under the home directory; repeatable",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=DEFAULT_TIMEOUT_SECS,
@@ -121,6 +129,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     args.stage = args.stage or []
     args.context = args.context or []
+    args.allow_read = args.allow_read or []
     return args
 
 
@@ -213,7 +222,39 @@ def stage(paths: list[str], work_dir: Path) -> None:
             shutil.copy2(source, work_dir / source.name)
 
 
+def sandbox_string(path: Path) -> str:
+    """Quote a path as a sandbox profile string literal."""
+    return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def sandbox_profile(readable: list[Path]) -> str:
+    """Write the macOS sandbox profile the session runs under: the host's files are unreadable.
+
+    Reads are denied under every home directory, the temp root, and the shared tmp, where suites,
+    skills, checkers, and sibling runs live; the rest of the system stays readable so installed
+    tools keep working. The last matching rule wins, so each path in ``readable`` is opened again
+    after the denials: a directory with everything under it, anything else as that one path.
+    Reaching a path takes metadata on each of its parents, so those are opened for metadata only,
+    which lets a parent be traversed but not listed. Writes are not confined.
+    """
+    denied = [
+        Path("/Users"),
+        Path.home().resolve(),
+        Path(tempfile.gettempdir()).resolve(),
+        Path("/private/tmp"),
+    ]
+    lines = ["(version 1)", "(allow default)"]
+    lines += [f"(deny file-read* (subpath {sandbox_string(path)}))" for path in denied]
+    parents = sorted({parent for path in readable for parent in path.parents})
+    lines += [f"(allow file-read-metadata (literal {sandbox_string(path)}))" for path in parents]
+    for path in readable:
+        scope = "subpath" if path.is_dir() else "literal"
+        lines.append(f"(allow file-read* ({scope} {sandbox_string(path)}))")
+    return "\n".join(lines) + "\n"
+
+
 def build_command(
+    claude: str,
     model: str,
     effort: str,
     mcp_config: str | None,
@@ -224,7 +265,7 @@ def build_command(
     """Assemble the claude argv: the measured condition every anchor was taken under."""
     if mcp_config is not None:
         cmd = [
-            "claude",
+            claude,
             "-p",
             "--setting-sources",
             "",
@@ -240,7 +281,7 @@ def build_command(
         ]
     else:
         cmd = [
-            "claude",
+            claude,
             "-p",
             "--safe-mode",
             "--model",
@@ -259,14 +300,20 @@ def build_command(
     return cmd
 
 
-def run_session(cmd: list[str], work_dir: Path, result_file: Path, timeout_secs: float) -> int:
+def run_session(
+    cmd: list[str], work_dir: Path, session_tmp: Path, result_file: Path, timeout_secs: float
+) -> int:
     """Run claude in the work dir under a watchdog; a killed session is failed, not graded.
 
     The subject session must not see smevals task metadata: scalar task fields become
     ``SMEVALS_TASK_*`` vars and can carry grading keys (a task's ``expected:``). The command
-    already holds the resolved model and effort, so nothing in the session needs them.
+    already holds the resolved model and effort, so nothing in the session needs them. The
+    session's temp files go to a dir of its own: the sandbox leaves the host's temp dirs
+    writable but unreadable, and claude's default temp dir is shared with every other session.
     """
     env = {key: value for key, value in os.environ.items() if not key.startswith("SMEVALS_")}
+    env["TMPDIR"] = str(session_tmp)
+    env["CLAUDE_CODE_TMPDIR"] = str(session_tmp)
     with result_file.open("wb") as out:
         proc = subprocess.Popen(cmd, cwd=work_dir, stdin=subprocess.DEVNULL, stdout=out, env=env)
         try:
@@ -334,6 +381,15 @@ def main(argv: list[str] | None = None) -> int:
             f"refusing to run in a run dir that already holds {WORKED_DIR}/: {run_dir}; "
             "the copy-back needs that name; run under smevals, which makes a fresh run dir"
         )
+    sandbox_exec = shutil.which("sandbox-exec")
+    if sandbox_exec is None:
+        fail(
+            "sandbox-exec not found on PATH; the subject session runs under the macOS sandbox, "
+            "so this runner needs macOS"
+        )
+    claude = shutil.which("claude")
+    if claude is None:
+        fail("claude not found on PATH; install Claude Code or fix PATH")
     home = os.environ.get("HOME", "")
     for context in args.context:
         if not Path(context).is_file():
@@ -341,6 +397,10 @@ def main(argv: list[str] | None = None) -> int:
     for staged in args.stage:
         if not Path(staged).exists():
             fail(f"--stage path not found: {staged}")
+    for allowed in args.allow_read:
+        if not Path(allowed).exists():
+            fail(f"--allow-read path not found: {allowed}")
+    allow_read = [Path(allowed).resolve() for allowed in args.allow_read]
     if args.subject is not None and not Path(args.subject).is_file():
         fail(f"--subject file not found: {args.subject}")
     mcp_config = None
@@ -353,17 +413,36 @@ def main(argv: list[str] | None = None) -> int:
     # Command substitution in the shell runners strips trailing newlines from the prompt.
     prompt = sys.stdin.read().rstrip("\n")
 
-    work_dir = Path(tempfile.mkdtemp())
-    scratch = Path(tempfile.mkdtemp())
+    # Resolved, because the sandbox profile matches the paths the kernel resolves to.
+    work_dir = Path(tempfile.mkdtemp()).resolve()
+    session_tmp = Path(tempfile.mkdtemp()).resolve()
+    scratch = Path(tempfile.mkdtemp()).resolve()
     try:
         stage(args.stage, work_dir)
+        # What the session reads besides the system: its own dirs, the claude executable (the
+        # path it is run by and the file that resolves to), and the two files OAuth needs.
+        readable = [
+            work_dir,
+            session_tmp,
+            Path(os.path.abspath(claude)),
+            Path(claude).resolve(),
+            Path.home().resolve() / "Library" / "Keychains",
+            Path.home().resolve() / ".claude.json",
+            *allow_read,
+        ]
         context_file = None
         if context_text is not None:
             context_file = scratch / "context.md"
             context_file.write_text(context_text, encoding="utf-8")
+            readable.append(context_file)
+        if mcp_config is not None:
+            readable.append(Path(mcp_config).resolve())
         result_file = scratch / "result.json"
-        cmd = build_command(model, effort, mcp_config, context_file, args.claude_args, prompt)
-        rc = run_session(cmd, work_dir, result_file, args.timeout)
+        cmd = [sandbox_exec, "-p", sandbox_profile(readable)]
+        cmd += build_command(
+            claude, model, effort, mcp_config, context_file, args.claude_args, prompt
+        )
+        rc = run_session(cmd, work_dir, session_tmp, result_file, args.timeout)
         copy_back(work_dir, run_dir)
         if context_text is not None:
             (run_dir / "subject-context.md").write_text(context_text, encoding="utf-8")
@@ -371,9 +450,11 @@ def main(argv: list[str] | None = None) -> int:
         lines = [f"runner: {PROG} {version(PROG)}\n", f"model: {model}\n"]
         if effort:
             lines.append(f"effort: {effort}\n")
+        lines += [f"allow-read: {allowed}\n" for allowed in allow_read]
         condition_file.write_text("".join(lines), encoding="utf-8")
         emit_result(result_file, condition_file)
         return rc
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+        shutil.rmtree(session_tmp, ignore_errors=True)
         shutil.rmtree(scratch, ignore_errors=True)

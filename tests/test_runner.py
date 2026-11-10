@@ -20,7 +20,11 @@ RUNNER_LINE = f"runner: smevals-claude-code {version('smevals-claude-code')}\n"
 # would (one edit, one new file), then exits with STUB_EXIT. It prints the JSON result record
 # claude -p --output-format json prints (or STUB_RAW verbatim, for a session whose output is not
 # a result record). STUB_SLEEP simulates a hung session for the watchdog test; the TERM trap and
-# backgrounded sleep model the real claude CLI dying promptly on SIGTERM.
+# backgrounded sleep model the real claude CLI dying promptly on SIGTERM. STUB_PROBE names a path
+# the stub tries to read, as a directory listing or a file, recording readable or denied. The
+# stub also records the temp dirs it was handed and whether a temp file round-trips there. Its
+# log lives on the host side of the sandbox, writable but not readable, so it is written only by
+# shell builtins: cat and cp inspect their destination and are refused.
 STUB = """#!/usr/bin/env bash
 set -euo pipefail
 trap 'exit 143' TERM
@@ -29,7 +33,10 @@ printf '%s\\n' "$@" > "$STUB_LOG.argv"
 env | grep '^SMEVALS_' > "$STUB_LOG.env" || true
 prev=""
 for a in "$@"; do
-  if [[ $prev == --append-system-prompt-file ]]; then cp "$a" "$STUB_LOG.ctx"; fi
+  if [[ $prev == --append-system-prompt-file ]]; then
+    ctx=$(cat "$a"; printf x)
+    printf '%s' "${ctx%x}" > "$STUB_LOG.ctx"
+  fi
   prev="$a"
 done
 sleep "${STUB_SLEEP:-0}" </dev/null >/dev/null 2>&1 &
@@ -38,6 +45,20 @@ if [[ -f staged/fixture.md ]]; then
   echo "stub edit" >> staged/fixture.md
 fi
 echo "stub artifact" > stub-marker.md
+if [[ -n ${STUB_PROBE:-} ]]; then
+  if ls "$STUB_PROBE"/ >/dev/null 2>&1 || cat "$STUB_PROBE" >/dev/null 2>&1; then
+    echo readable > "$STUB_LOG.probe"
+  else
+    echo denied > "$STUB_LOG.probe"
+  fi
+fi
+printf '%s\\n' "${TMPDIR:-}" "${CLAUDE_CODE_TMPDIR:-}" > "$STUB_LOG.tmpdirs"
+if tmp_file=$(mktemp "${TMPDIR:-/nonexistent}/stub.XXXXXX" 2>/dev/null) \\
+  && echo round-trip > "$tmp_file" && tmp_body=$(cat "$tmp_file" 2>/dev/null); then
+  printf '%s\\n' "$tmp_body" > "$STUB_LOG.tmp"
+else
+  echo failed > "$STUB_LOG.tmp"
+fi
 if [[ -n ${STUB_HOSTILE:-} ]]; then
   # A subject that plants a module and squats names the runner and smevals write later.
   printf 'raise SystemExit("hijacked json module")\\n' > json.py
@@ -99,6 +120,10 @@ class Scratch:
     def claude_invoked(self) -> bool:
         return (self.root / "stub-log.pwd").is_file()
 
+    def probe(self) -> str:
+        probe_file = self.root / "stub-log.probe"
+        return probe_file.read_text().strip() if probe_file.is_file() else "no probe ran"
+
     def condition(self) -> str:
         path = self.run_dir / "subject-condition.md"
         return path.read_text() if path.is_file() else "missing"
@@ -143,6 +168,107 @@ def test_isolated_session(scratch: Scratch) -> None:
     assert fixture.is_file()
     assert "stub edit" in fixture.read_text()
     assert (scratch.run_dir / "worked" / "stub-marker.md").is_file()
+
+
+def host_paths_the_subject_must_not_read() -> list:
+    in_home = pytest.mark.skipif(
+        Path("/Users") not in REPO_ROOT.parents, reason="this checkout is not under /Users"
+    )
+    return [
+        pytest.param(lambda s: s.corpus / "staged" / "fixture.md", id="original of a staged file"),
+        pytest.param(lambda s: s.corpus, id="sibling directory under the temp root"),
+        pytest.param(lambda s: s.run_dir, id="run dir"),
+        pytest.param(lambda _: Path("/private/tmp"), id="shared tmp"),
+        pytest.param(lambda _: REPO_ROOT / "pyproject.toml", id="file under home", marks=in_home),
+        pytest.param(lambda _: REPO_ROOT, id="directory under home", marks=in_home),
+    ]
+
+
+@pytest.mark.parametrize("host_path", host_paths_the_subject_must_not_read())
+def test_subject_cannot_read_the_host_outside_its_work_dir(scratch: Scratch, host_path) -> None:
+    scratch.env["STUB_PROBE"] = str(host_path(scratch))
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.probe() == "denied"
+
+
+@pytest.mark.parametrize("staged_path", ["staged/fixture.md", "staged", "."])
+def test_subject_reads_its_own_work_dir(scratch: Scratch, staged_path: str) -> None:
+    scratch.env["STUB_PROBE"] = staged_path
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.probe() == "readable"
+
+
+def test_allow_read_opens_a_directory_and_a_file_and_is_recorded(scratch: Scratch) -> None:
+    tools = scratch.root / "tools"
+    (tools / "bin").mkdir(parents=True)
+    (tools / "bin" / "tool").write_text("tool body\n")
+    lone = scratch.root / "single-file.md"
+    for probe in (tools / "bin", tools / "bin" / "tool", lone):
+        scratch.env["STUB_PROBE"] = str(probe)
+        (scratch.root / "stub-log.probe").unlink(missing_ok=True)
+        run_dir = scratch.root / f"run-{probe.name}"
+        run_dir.mkdir()
+        scratch.run_dir = run_dir
+        proc = scratch.run(["--allow-read", str(tools), "--allow-read", str(lone)])
+        assert proc.returncode == 0, proc.stderr
+        assert scratch.probe() == "readable", probe
+    assert scratch.condition() == (
+        RUNNER_LINE
+        + "model: stub-model\n"
+        + f"allow-read: {tools.resolve()}\n"
+        + f"allow-read: {lone.resolve()}\n"
+        + "resolved: stub-model-id\n"
+    )
+
+
+def test_allow_read_does_not_open_its_siblings(scratch: Scratch) -> None:
+    tools = scratch.root / "tools"
+    tools.mkdir()
+    scratch.env["STUB_PROBE"] = str(scratch.corpus / "staged" / "fixture.md")
+    proc = scratch.run(["--stage", str(scratch.corpus), "--allow-read", str(tools)])
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.probe() == "denied"
+
+
+def test_missing_allow_read_path_fails_before_claude(scratch: Scratch) -> None:
+    proc = scratch.run(["--allow-read", str(scratch.root / "no-such-tools")])
+    assert proc.returncode == 1
+    assert "--allow-read path not found" in proc.stderr
+    assert "no-such-tools" in proc.stderr
+    assert not scratch.claude_invoked()
+
+
+def test_session_gets_a_private_temp_dir_it_can_use(scratch: Scratch) -> None:
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 0, proc.stderr
+    assert (scratch.root / "stub-log.tmp").read_text() == "round-trip\n"
+    tmpdir, claude_tmpdir = (scratch.root / "stub-log.tmpdirs").read_text().splitlines()
+    assert tmpdir == claude_tmpdir
+    stub_pwd = (scratch.root / "stub-log.pwd").read_text().strip()
+    assert tmpdir != stub_pwd, "temp files stay out of the worked tree"
+    assert not Path(tmpdir).exists(), "session temp dir cleaned up after the run"
+
+
+def test_missing_sandbox_exec_fails_before_claude(scratch: Scratch) -> None:
+    scratch.env["PATH"] = str(scratch.root / "bin")
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 1
+    assert "sandbox-exec not found on PATH" in proc.stderr
+    assert not scratch.claude_invoked()
+    assert not (scratch.run_dir / "worked").exists()
+
+
+def test_missing_claude_fails_naming_it(scratch: Scratch) -> None:
+    only_sandbox = scratch.root / "only-sandbox"
+    only_sandbox.mkdir()
+    (only_sandbox / "sandbox-exec").symlink_to("/usr/bin/sandbox-exec")
+    scratch.env["PATH"] = str(only_sandbox)
+    proc = scratch.run(["--stage", str(scratch.corpus)])
+    assert proc.returncode == 1
+    assert "claude not found on PATH" in proc.stderr
+    assert not (scratch.run_dir / "worked").exists()
 
 
 def test_single_file_staging(scratch: Scratch) -> None:
@@ -396,6 +522,7 @@ def test_pinned_plus_config_effort_is_refused(scratch: Scratch) -> None:
 def test_mcp_session_swaps_safe_mode_for_strict_setting_sources(scratch: Scratch) -> None:
     mcp_file = scratch.root / "mcp.json"
     mcp_file.write_text('{"mcpServers":{}}\n')
+    scratch.env["STUB_PROBE"] = str(mcp_file)
     proc = scratch.run(["--stage", str(scratch.corpus), "--mcp-config", str(mcp_file)])
     assert proc.returncode == 0
     assert proc.stderr == ""
@@ -404,6 +531,7 @@ def test_mcp_session_swaps_safe_mode_for_strict_setting_sources(scratch: Scratch
     assert argv[argv.index("--setting-sources") + 1] == ""
     assert "--strict-mcp-config" in argv
     assert argv[argv.index("--mcp-config") + 1] == str(mcp_file)
+    assert scratch.probe() == "readable", "the session can read the MCP config it was handed"
     assert argv[argv.index("--model") + 1] == "stub-model"
 
 
