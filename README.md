@@ -7,7 +7,7 @@ The session runs under the macOS sandbox, so the runner needs macOS.
 ## Install
 
 ```bash
-uv tool install "smevals-claude-code @ git+https://github.com/hhauer/smevals-claude-code@v0.6.0"
+uv tool install "smevals-claude-code @ git+https://github.com/hhauer/smevals-claude-code@v0.7.0"
 ```
 
 Pin a tag. A new version can change the `claude` command line or what the session can reach, which is the condition every eval anchor was measured under.
@@ -28,7 +28,7 @@ The runner then does this, in order:
 1. Checks every path it was given and fails before `claude` starts if one is missing.
 2. Makes a work dir, a home, and a temp dir for the session, outside any repo.
 3. Copies each `--stage` path into the work dir.
-4. Runs `claude` in the work dir, inside the sandbox.
+4. Runs `claude` in the work dir, or in the directory inside it that `--cwd` names, inside the sandbox.
 5. Copies the work dir into `worked/` in the run dir, whether the session passed, failed, or was killed.
 6. Writes its records beside `worked/` and prints the session's answer on stdout.
 
@@ -52,7 +52,7 @@ claude -p --safe-mode --model <model> --permission-mode acceptEdits --output-for
 - **Hidden, for reading and writing:** `/Users`, your home directory, the run dir, every other run's work dir, and Claude Code's shared temp dir. A suite's skills, fixtures, and checkers are therefore out of reach unless staged.
 - **Its own:** the work dir, a temp dir, and a home that holds only a git config with a fixed identity (`Eval Subject <subject@example.invalid>`). A subject that commits does so under that name on every machine. `--home-copy` adds files to that home.
 - **Still readable:** the rest of the system, so installed tools work, and the shared temp dirs (`/tmp` and the per-user temp root) outside the runner's own.
-- **Environment:** every `SMEVALS_*` and `XDG_*` variable is removed, and `HOME` and `TMPDIR` point at the session's own dirs. Anything else you export reaches the subject.
+- **Environment:** every `SMEVALS_*` and `XDG_*` variable is removed, `HOME` and `TMPDIR` point at the session's own dirs, and `PWD` names the directory the session starts in. Anything else you export reaches the subject.
 - **Not dropped by `--safe-mode`:** the machine's managed settings. See `--hide-managed-settings`.
 
 ## Flags
@@ -66,6 +66,21 @@ Use it for every fixture the subject should find in its work dir. A directory is
 ```bash
 smevals-claude-code --stage "$CORPUS" --stage "$SUITE/task-notes.md"
 ```
+
+### Starting in a subdirectory: `--cwd SUBDIR`
+
+Use it when the subject runs in production inside a repository clone and writes beside it, for example to `../scratch`. A session started at the work dir root cannot write to the directory above it. Stage a tree that holds the clone as a subdirectory and name that subdirectory:
+
+```bash
+smevals-claude-code --stage "$STAGED" --cwd clone
+```
+
+The session starts in `clone/` inside the work dir, so `..` is the work dir root, which the session owns.
+
+- **`SUBDIR` is a path from the work dir root.** The run is refused before `claude` starts when it is empty, is absolute, has a `..` in it, is not a directory once staging is done, or is a staged symlink that leads out of the work dir.
+- **Nothing else about the session changes.** The command line, the sandbox, the home, and the temp dir are the same.
+- **The whole work dir is copied back.** The clone is `worked/clone`, and whatever the subject wrote beside it is in `worked/` too.
+- **It is recorded** in `subject-condition.md` as `cwd: SUBDIR`.
 
 ### Production context: `--context FILE` and `--rules DIR`
 
@@ -170,7 +185,7 @@ The exit code is the session's own. A session the watchdog killed exits non-zero
 
 ### Checking a run's condition
 
-`subject-condition.md` holds one `key: value` line for each of: the runner version, the Claude Code version, the model, the effort, a SHA-256 of the assembled context, the arguments forwarded to `claude`, each `--allow-read` grant, hidden managed settings, the plugin root, each `--home-copy` entry, the idle limit, and, as `resolved:`, the model IDs the session reports having used. A line appears only when it applies.
+`subject-condition.md` holds one `key: value` line for each of: the runner version, the Claude Code version, the model, the effort, a SHA-256 of the assembled context, the arguments forwarded to `claude`, each `--allow-read` grant, hidden managed settings, the plugin root, each `--home-copy` entry, the idle limit, the `--cwd` directory, and, as `resolved:`, the model IDs the session reports having used. A line appears only when it applies.
 
 A `home-copy:` line holds the home-relative path and a digest of the files copied, for example `home-copy: .hooks sha256:<digest>`. The digest covers every file in sorted path order: its home-relative path, a NUL byte, its permission bits in octal, a NUL byte, its size in decimal, a NUL byte, and its bytes.
 
