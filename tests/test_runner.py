@@ -1,6 +1,7 @@
 # ABOUTME: Black-box contract tests for the smevals-claude-code runner: a stubbed claude on PATH
 # ABOUTME: records cwd, argv, and env so the isolation and condition contracts are asserted exactly.
 
+import json
 import os
 import subprocess
 import sys
@@ -16,6 +17,15 @@ RUNNER = Path(sys.executable).parent / "smevals-claude-code"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RUNNER_LINE = f"runner: smevals-claude-code {version('smevals-claude-code')}\n"
 
+# What the stub prints when it is asked for stream-json: a session whose background job outlived
+# a turn, so it reports two results and the last one is the run's.
+STREAM_LINES = [
+    '{"type":"system","subtype":"init"}',
+    '{"type":"result","result":"FIRST-TURN","modelUsage":{"early-model-id":{}}}',
+    '{"type":"assistant","text":"line separator \u2028 inside a string"}',
+    '{"type":"result","result":"STUB-RESULT\\ntwo lines","modelUsage":{"stub-model-id":{}}}',
+]
+
 # The claude stub records its cwd and argv, edits a staged file the way a subject session
 # would (one edit, one new file), then exits with STUB_EXIT. It prints the JSON result record
 # claude -p --output-format json prints (or STUB_RAW verbatim, for a session whose output is not
@@ -24,7 +34,9 @@ RUNNER_LINE = f"runner: smevals-claude-code {version('smevals-claude-code')}\n"
 # a curious or hostile subject would and record how the sandbox answered: STUB_PROBE names a path
 # to read (as a directory listing or a file), STUB_STEAL a path to hard-link or move into the work
 # dir, and STUB_PLANT a path to create. The stub also records the home and temp dirs it was
-# handed, where the home's keychain link points, and whether a temp file round-trips.
+# handed, where the home's keychain link points, and whether a temp file round-trips. Asked for
+# stream-json it prints STUB_STREAM verbatim instead of a result record, and STUB_LINGER leaves a
+# background process holding its stdout open after it exits.
 STUB = """#!/usr/bin/env bash
 set -euo pipefail
 trap 'exit 143' TERM
@@ -81,7 +93,12 @@ if [[ -n ${STUB_HOSTILE:-} ]]; then
   ln -s "$STUB_HOSTILE" subject-context.md
   ln -s "$STUB_HOSTILE" output.txt
 fi
-if [[ -n ${STUB_RAW:-} ]]; then
+if [[ -n ${STUB_LINGER:-} ]]; then
+  sleep "$STUB_LINGER" </dev/null 2>/dev/null &
+fi
+if [[ " $* " == *" stream-json "* ]]; then
+  printf '%s' "${STUB_STREAM:-}"
+elif [[ -n ${STUB_RAW:-} ]]; then
   printf '%s\\n' "$STUB_RAW"
 else
   printf '%s\\n' \\
@@ -128,6 +145,7 @@ class Scratch:
                 "TMPDIR": str(temp_root),
                 "STUB_LOG": str(root / "stub-log"),
                 "SMEVALS_MODEL": "stub-model",
+                "STUB_STREAM": "".join(line + "\n" for line in STREAM_LINES),
             }
         )
 
@@ -156,6 +174,12 @@ class Scratch:
 
     def probe(self) -> str:
         return self.recorded("probe")
+
+    def stream(self) -> list[tuple[float, str]]:
+        """The recorded stream as (arrival time, line) pairs."""
+        text = (self.run_dir / "subject-stream.jsonl").read_text(encoding="utf-8")
+        pairs = [line.split(" ", 1) for line in text.split("\n") if line]
+        return [(float(stamp), body) for stamp, body in pairs]
 
     def condition(self) -> str:
         path = self.run_dir / "subject-condition.md"
@@ -676,3 +700,122 @@ def test_refuses_a_git_work_tree_root_as_the_run_dir(scratch: Scratch, make_git)
     assert "refusing to run in a git work-tree root" in proc.stderr
     assert not scratch.claude_invoked()
     assert not (scratch.run_dir / "worked" / "staged" / "fixture.md").exists()
+
+
+def test_stream_mode_asks_claude_for_the_stream(scratch: Scratch) -> None:
+    proc = scratch.run(["--stage", str(scratch.corpus), "--stream"])
+    assert proc.returncode == 0, proc.stderr
+    assert scratch.argv()[:10] == [
+        "-p",
+        "--safe-mode",
+        "--model",
+        "stub-model",
+        "--permission-mode",
+        "acceptEdits",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--",
+    ]
+
+
+def test_stream_mode_under_an_mcp_config_asks_for_the_stream(scratch: Scratch) -> None:
+    mcp_file = scratch.root / "mcp.json"
+    mcp_file.write_text('{"mcpServers":{}}\n')
+    proc = scratch.run(["--mcp-config", str(mcp_file), "--stream"])
+    assert proc.returncode == 0, proc.stderr
+    argv = scratch.argv()
+    assert argv[argv.index("--output-format") + 1 :][:2] == ["stream-json", "--verbose"]
+    assert "--strict-mcp-config" in argv
+
+
+def test_stream_mode_records_each_line_with_its_arrival_time(scratch: Scratch) -> None:
+    before = time.time()
+    proc = scratch.run(["--stage", str(scratch.corpus), "--stream"])
+    after = time.time()
+    assert proc.returncode == 0, proc.stderr
+    stream = scratch.stream()
+    bodies = [body for _, body in stream]
+    # The runner's own first and last lines let a reader count the quiet time before the
+    # session's first event and after its last.
+    assert json.loads(bodies[0]) == {"type": "runner_launch"}
+    assert bodies[1:-1] == STREAM_LINES
+    assert json.loads(bodies[-1]) == {"type": "runner_exit", "returncode": 0}
+    stamps = [stamp for stamp, _ in stream]
+    assert stamps == sorted(stamps)
+    # Stamps carry milliseconds, so they can round to just outside the clock readings.
+    assert before - 0.001 <= stamps[0]
+    assert stamps[-1] <= after + 0.001
+    raw = (scratch.run_dir / "subject-stream.jsonl").read_text(encoding="utf-8")
+    assert all(len(line.split(" ", 1)[0].split(".")[1]) == 3 for line in raw.split("\n") if line)
+
+
+def test_stream_mode_reports_the_last_result(scratch: Scratch) -> None:
+    proc = scratch.run(["--stage", str(scratch.corpus), "--stream"])
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == ""
+    assert proc.stdout == "STUB-RESULT\ntwo lines\n"
+    assert scratch.condition() == RUNNER_LINE + "model: stub-model\nresolved: stub-model-id\n"
+
+
+def test_stream_file_sits_beside_the_worked_tree_not_in_it(scratch: Scratch) -> None:
+    proc = scratch.run(["--stage", str(scratch.corpus), "--stream"])
+    assert proc.returncode == 0, proc.stderr
+    assert sorted(entry.name for entry in scratch.run_dir.iterdir()) == [
+        "subject-condition.md",
+        "subject-stream.jsonl",
+        "worked",
+    ]
+    assert not (scratch.run_dir / "worked" / "subject-stream.jsonl").exists()
+
+
+def test_stream_with_no_result_event_prints_nothing_and_says_so(scratch: Scratch) -> None:
+    scratch.env["STUB_STREAM"] = '{"type":"system","subtype":"init"}\nnot json at all\n'
+    proc = scratch.run(["--stage", str(scratch.corpus), "--stream"])
+    assert proc.returncode == 0
+    assert proc.stdout == ""
+    assert "no result event" in proc.stderr
+    assert scratch.condition() == RUNNER_LINE + "model: stub-model\n"
+    assert [body for _, body in scratch.stream()][1:-1] == [
+        '{"type":"system","subtype":"init"}',
+        "not json at all",
+    ]
+
+
+def test_stream_mode_stamps_a_final_line_that_has_no_newline(scratch: Scratch) -> None:
+    cut = '{"type":"result","result":"CUT","modelUsage":{}}'
+    scratch.env["STUB_STREAM"] = '{"type":"system"}\n' + cut
+    proc = scratch.run(["--stage", str(scratch.corpus), "--stream"])
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "CUT\n"
+    assert [body for _, body in scratch.stream()][1:-1] == ['{"type":"system"}', cut]
+
+
+def test_stream_mode_propagates_a_failing_exit_and_records_it(scratch: Scratch) -> None:
+    scratch.env["STUB_EXIT"] = "7"
+    proc = scratch.run(["--stage", str(scratch.corpus), "--stream"])
+    assert proc.returncode == 7
+    assert json.loads(scratch.stream()[-1][1]) == {"type": "runner_exit", "returncode": 7}
+    assert (scratch.run_dir / "worked" / "staged" / "fixture.md").is_file()
+
+
+def test_stream_mode_watchdog_kills_a_hung_session(scratch: Scratch) -> None:
+    scratch.env["STUB_SLEEP"] = "30"
+    start = time.monotonic()
+    proc = scratch.run(["--stage", str(scratch.corpus), "--stream", "--timeout", "1"])
+    assert time.monotonic() - start < 20
+    assert proc.returncode != 0
+    assert proc.stdout == ""
+    bodies = [body for _, body in scratch.stream()]
+    assert json.loads(bodies[0]) == {"type": "runner_launch"}
+    assert json.loads(bodies[-1]) == {"type": "runner_exit", "returncode": proc.returncode}
+
+
+def test_stream_mode_does_not_wait_on_a_process_the_session_left_behind(scratch: Scratch) -> None:
+    # A background job the subject started keeps the session's stdout open after claude exits.
+    scratch.env["STUB_LINGER"] = "20"
+    start = time.monotonic()
+    proc = scratch.run(["--stage", str(scratch.corpus), "--stream"])
+    assert time.monotonic() - start < 10
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "STUB-RESULT\ntwo lines\n"
