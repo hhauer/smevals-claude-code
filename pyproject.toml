@@ -2,7 +2,7 @@
 name = "smevals-claude-code"
 version = "0.7.0"
 description = "A reusable smevals Runner that drives an isolated headless Claude Code session"
-requires-python = ">= 3.15"
+requires-python = "==3.15.*"
 
 [project.scripts]
 smevals-claude-code = "smevals_claude_code.cli:main"
@@ -28,7 +28,6 @@ requires = ["uv_build>=0.13.0,<0.14"]
 build-backend = "uv_build"
 
 [tool.ruff]
-target-version = "py315"
 line-length = 100
 
 [tool.ruff.lint]
@@ -39,9 +38,6 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "ARG", "SIM", "ERA", "D", "P
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
-
-[tool.ty.environment]
-python-version = "3.15"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
